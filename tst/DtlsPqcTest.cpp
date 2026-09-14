@@ -38,7 +38,7 @@ class DtlsPqcConnectionTest : public WebRtcClientTestBase {
     }
 
     // Applications provide native OpenSSL certificate/key objects using the existing certificate API.
-    void createPeer(UINT32 index, PRtcDtlsConfiguration dtls, bool pqcCertificate)
+    void createPeer(UINT32 index, PRtcDtlsConfiguration dtls, bool pqcCertificate, const RtcDtlsOptions* options = nullptr)
     {
         RtcConfiguration config{};
         std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> key(nullptr, EVP_PKEY_free);
@@ -62,7 +62,7 @@ class DtlsPqcConnectionTest : public WebRtcClientTestBase {
             config.certificates[0].pCertificate = (PBYTE) certificate.get();
             config.certificates[0].pPrivateKey = (PBYTE) key.get();
         }
-        ASSERT_EQ(STATUS_SUCCESS, createPeerConnectionWithDtlsConfiguration(&config, dtls, &peers[index]));
+        ASSERT_EQ(STATUS_SUCCESS, createPeerConnectionWithDtlsOptions(&config, dtls, options, &peers[index]));
         // The caller's references are released on return, before the handshake begins.
     }
 
@@ -179,12 +179,12 @@ class DtlsPqcConnectionTest : public WebRtcClientTestBase {
     }
 #endif
 
-    void verifyProfile(const CHAR* group, const CHAR* signature, bool pqcCertificate)
+    void verifyProfile(const CHAR* group, const CHAR* signature, bool pqcCertificate, const RtcDtlsOptions* options = nullptr)
     {
         RtcDtlsConfiguration dtls{group, signature};
-        createPeer(0, &dtls, pqcCertificate);
+        createPeer(0, &dtls, pqcCertificate, options);
         ASSERT_FALSE(HasFatalFailure());
-        createPeer(1, &dtls, pqcCertificate);
+        createPeer(1, &dtls, pqcCertificate, options);
         ASSERT_FALSE(HasFatalFailure());
         // Include media so both SRTP and SCTP use the negotiated DTLS transport.
         for (auto peer : peers) {
@@ -200,6 +200,21 @@ class DtlsPqcConnectionTest : public WebRtcClientTestBase {
 
         DtlsKeyingMaterial material[2]{};
         for (UINT32 i = 0; i < 2; ++i) {
+            RtcDtlsInfo info{};
+            info.structSize = SIZEOF(info);
+            ASSERT_EQ(STATUS_SUCCESS, getPeerConnectionDtlsInfo(peers[i], &info));
+            const UINT32 required = RTC_DTLS_INFO_PROTOCOL | RTC_DTLS_INFO_CIPHER | RTC_DTLS_INFO_GROUP |
+                RTC_DTLS_INFO_LOCAL_SIGNATURE | RTC_DTLS_INFO_REMOTE_SIGNATURE | RTC_DTLS_INFO_SESSION_REUSED | RTC_DTLS_INFO_EARLY_DATA;
+            EXPECT_EQ(required, info.validFields & required);
+            EXPECT_EQ(DTLS1_3_VERSION, info.protocolVersion);
+            EXPECT_EQ(0, STRCMPI(group, info.group));
+            EXPECT_STREQ(signature, info.localSignatureAlgorithm);
+            EXPECT_STREQ(signature, info.remoteSignatureAlgorithm);
+            EXPECT_FALSE(info.sessionResumed);
+            EXPECT_EQ(RTC_DTLS_EARLY_DATA_NOT_SENT, info.earlyDataStatus);
+            if (options != nullptr && options->pCipherSuites != nullptr && STRCMP(options->pCipherSuites, "TLS_AES_256_GCM_SHA384") == 0) {
+                EXPECT_EQ(0x1302, info.cipherSuite);
+            }
             PDtlsSession session = ((PKvsPeerConnection) peers[i])->pDtlsSession;
             const CHAR* peerSignature = nullptr;
             // The peer transport remains live on other threads while these OpenSSL fields are inspected.
@@ -294,6 +309,187 @@ TEST_F(DtlsPqcConnectionTest, existingEntryPointKeepsDtls12)
     }
 }
 
+TEST_F(DtlsPqcConnectionTest, optionsRejectMalformedInputsWithoutPublishingPeer)
+{
+    RtcConfiguration config{};
+    RtcDtlsConfiguration dtls{"X25519", "ecdsa_secp256r1_sha256"};
+    RtcDtlsOptions options{};
+    options.structSize = SIZEOF(options);
+    auto rejected = [&](PRtcConfiguration configuration, PRtcDtlsConfiguration selectors, STATUS expected) {
+        PRtcPeerConnection out = reinterpret_cast<PRtcPeerConnection>(static_cast<uintptr_t>(1));
+        EXPECT_EQ(expected, createPeerConnectionWithDtlsOptions(configuration, selectors, &options, &out));
+        EXPECT_EQ(nullptr, out);
+        if (out != nullptr && out != reinterpret_cast<PRtcPeerConnection>(static_cast<uintptr_t>(1))) {
+            freePeerConnection(&out);
+        }
+    };
+    rejected(nullptr, &dtls, STATUS_NULL_ARG);
+    rejected(&config, nullptr, STATUS_NULL_ARG);
+    EXPECT_EQ(STATUS_NULL_ARG, createPeerConnectionWithDtlsOptions(&config, &dtls, &options, nullptr));
+    for (UINT32 size : {0u, static_cast<UINT32>(SIZEOF(options) - 1), static_cast<UINT32>(SIZEOF(options) + 1)}) {
+        options.structSize = size;
+        rejected(&config, &dtls, STATUS_INVALID_ARG);
+    }
+    options.structSize = SIZEOF(options);
+    for (RTC_DTLS_OPTION* field : {&options.resumption, &options.tickets, &options.earlyData}) {
+        *field = static_cast<RTC_DTLS_OPTION>(3);
+        rejected(&config, &dtls, STATUS_INVALID_ARG);
+        *field = static_cast<RTC_DTLS_OPTION>(-1);
+        rejected(&config, &dtls, STATUS_INVALID_ARG);
+        *field = RTC_DTLS_OPTION_DEFAULT;
+    }
+    for (const CHAR* cipher : {"", "not-a-cipher-suite"}) {
+        options.pCipherSuites = cipher;
+        rejected(&config, &dtls, STATUS_INVALID_ARG);
+    }
+}
+
+TEST_F(DtlsPqcConnectionTest, unsupportedPositiveSessionOptionsFailExplicitly)
+{
+    RtcConfiguration config{};
+    RtcDtlsConfiguration dtls{"X25519", "ecdsa_secp256r1_sha256"};
+    RtcDtlsOptions options{};
+    options.structSize = SIZEOF(options);
+    for (RTC_DTLS_OPTION* field : {&options.resumption, &options.tickets, &options.earlyData}) {
+        *field = RTC_DTLS_OPTION_ENABLED;
+        EXPECT_EQ(STATUS_NOT_IMPLEMENTED, createPeerConnectionWithDtlsOptions(&config, &dtls, &options, &peers[0]));
+        ASSERT_EQ(nullptr, peers[0]);
+        *field = RTC_DTLS_OPTION_DEFAULT;
+    }
+}
+
+TEST_F(DtlsPqcConnectionTest, nullAndDefaultOptionsPreserveExistingCreationBehavior)
+{
+    RtcConfiguration config{};
+    RtcDtlsConfiguration dtls{"X25519", "ecdsa_secp256r1_sha256"};
+    RtcDtlsOptions options{};
+    options.structSize = SIZEOF(options);
+    ASSERT_EQ(STATUS_SUCCESS, createPeerConnection(&config, &peers[0]));
+    ASSERT_EQ(STATUS_SUCCESS, createPeerConnectionWithDtlsOptions(&config, nullptr, nullptr, &peers[1]));
+    for (auto peer : peers) {
+        EXPECT_EQ(DTLS1_2_VERSION, SSL_get_max_proto_version(((PKvsPeerConnection) peer)->pDtlsSession->pSsl));
+    }
+    for (auto& peer : peers) {
+        ASSERT_EQ(STATUS_SUCCESS, freePeerConnection(&peer));
+    }
+    ASSERT_EQ(STATUS_SUCCESS, createPeerConnectionWithDtlsConfiguration(&config, &dtls, &peers[0]));
+    ASSERT_EQ(STATUS_SUCCESS, createPeerConnectionWithDtlsOptions(&config, &dtls, &options, &peers[1]));
+    auto* original = ((PKvsPeerConnection) peers[0])->pDtlsSession;
+    auto* withDefaults = ((PKvsPeerConnection) peers[1])->pDtlsSession;
+    EXPECT_EQ(DTLS1_3_VERSION, SSL_get_min_proto_version(withDefaults->pSsl));
+    EXPECT_EQ(DTLS1_3_VERSION, SSL_get_max_proto_version(withDefaults->pSsl));
+    EXPECT_EQ(SSL_get_options(original->pSsl), SSL_get_options(withDefaults->pSsl));
+    EXPECT_EQ(SSL_CTX_get_session_cache_mode(original->pSslCtx), SSL_CTX_get_session_cache_mode(withDefaults->pSslCtx));
+    EXPECT_EQ(SSL_get_num_tickets(original->pSsl), SSL_get_num_tickets(withDefaults->pSsl));
+    EXPECT_EQ(SSL_get_max_early_data(original->pSsl), SSL_get_max_early_data(withDefaults->pSsl));
+    EXPECT_EQ(SSL_get_recv_max_early_data(original->pSsl), SSL_get_recv_max_early_data(withDefaults->pSsl));
+}
+
+TEST_F(DtlsPqcConnectionTest, getterClearsUnavailableFactsAndRejectsIncompatibleSize)
+{
+    RtcDtlsConfiguration dtls{"X25519", "ecdsa_secp256r1_sha256"};
+    createPeer(0, &dtls, false);
+    ASSERT_FALSE(HasFatalFailure());
+    EXPECT_EQ(STATUS_NULL_ARG, getPeerConnectionDtlsInfo(peers[0], nullptr));
+    RtcDtlsInfo cleared{};
+    cleared.structSize = SIZEOF(cleared);
+    RtcDtlsInfo info;
+    MEMSET(&info, 0xa5, SIZEOF(info));
+    info.structSize = SIZEOF(info);
+    EXPECT_EQ(STATUS_INVALID_OPERATION, getPeerConnectionDtlsInfo(peers[0], &info));
+    EXPECT_EQ(0, MEMCMP(&cleared, &info, SIZEOF(info)));
+    MEMSET(&info, 0xa5, SIZEOF(info));
+    info.structSize = SIZEOF(info);
+    EXPECT_EQ(STATUS_NULL_ARG, getPeerConnectionDtlsInfo(nullptr, &info));
+    EXPECT_EQ(0, MEMCMP(&cleared, &info, SIZEOF(info)));
+    MEMSET(&info, 0xa5, SIZEOF(info));
+    info.structSize = SIZEOF(info) - 1;
+    RtcDtlsInfo unchanged = info;
+    EXPECT_EQ(STATUS_INVALID_ARG, getPeerConnectionDtlsInfo(peers[0], &info));
+    EXPECT_EQ(0, MEMCMP(&unchanged, &info, SIZEOF(info)));
+}
+
+TEST_F(DtlsPqcConnectionTest, cipherSelectionConsumesInputsAndCopiesActualNegotiation)
+{
+    {
+        CHAR group[] = "X25519";
+        CHAR signature[] = "ecdsa_secp256r1_sha256";
+        CHAR offered[] = "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256";
+        CHAR accepted[] = "TLS_AES_128_GCM_SHA256";
+        RtcDtlsConfiguration dtls{group, signature};
+        RtcDtlsOptions options{};
+        options.structSize = SIZEOF(options);
+        options.pCipherSuites = offered;
+        createPeer(0, &dtls, false, &options);
+        ASSERT_FALSE(HasFatalFailure());
+        options.pCipherSuites = accepted;
+        createPeer(1, &dtls, false, &options);
+        ASSERT_FALSE(HasFatalFailure());
+        // The SDK must have consumed both independent configurations before returning.
+        MEMSET(group, 'x', SIZEOF(group) - 1);
+        MEMSET(signature, 'x', SIZEOF(signature) - 1);
+        MEMSET(offered, 'x', SIZEOF(offered) - 1);
+        MEMSET(accepted, 'x', SIZEOF(accepted) - 1);
+    }
+#ifdef ENABLE_DATA_CHANNEL
+    prepareDataChannel();
+    ASSERT_FALSE(HasFatalFailure());
+#endif
+    ASSERT_EQ(STATUS_SUCCESS, connectPeers());
+    RtcDtlsInfo copies[2]{};
+    for (UINT32 i = 0; i < 2; ++i) {
+        copies[i].structSize = SIZEOF(copies[i]);
+        ASSERT_EQ(STATUS_SUCCESS, getPeerConnectionDtlsInfo(peers[i], &copies[i]));
+        EXPECT_EQ(RTC_DTLS_INFO_CIPHER, copies[i].validFields & RTC_DTLS_INFO_CIPHER);
+        EXPECT_EQ(0x1301, copies[i].cipherSuite); // Selected AES-128, not the client's first offer.
+        EXPECT_EQ(RTC_DTLS_INFO_GROUP, copies[i].validFields & RTC_DTLS_INFO_GROUP);
+        EXPECT_EQ(0, STRCMPI("X25519", copies[i].group));
+    }
+    RtcDtlsInfo saved = copies[0];
+    RtcDtlsInfo another{};
+    another.structSize = SIZEOF(another);
+    ASSERT_EQ(STATUS_SUCCESS, getPeerConnectionDtlsInfo(peers[0], &another));
+    EXPECT_EQ(0, MEMCMP(&saved, &copies[0], SIZEOF(saved)));
+    ASSERT_EQ(STATUS_SUCCESS, closePeerConnection(peers[0]));
+    MEMSET(&another, 0xa5, SIZEOF(another));
+    another.structSize = SIZEOF(another);
+    EXPECT_EQ(STATUS_INVALID_OPERATION, getPeerConnectionDtlsInfo(peers[0], &another));
+    RtcDtlsInfo cleared{};
+    cleared.structSize = SIZEOF(cleared);
+    EXPECT_EQ(0, MEMCMP(&cleared, &another, SIZEOF(another)));
+    ASSERT_EQ(STATUS_SUCCESS, freePeerConnection(&peers[0]));
+    EXPECT_EQ(0, MEMCMP(&saved, &copies[0], SIZEOF(saved)));
+}
+
+TEST_F(DtlsPqcConnectionTest, explicitDisablesConstrainBackendAndCompleteFullHandshake)
+{
+    RtcDtlsOptions options{};
+    options.structSize = SIZEOF(options);
+    options.pCipherSuites = "TLS_AES_256_GCM_SHA384";
+    options.resumption = RTC_DTLS_OPTION_DISABLED;
+    options.tickets = RTC_DTLS_OPTION_DISABLED;
+    options.earlyData = RTC_DTLS_OPTION_DISABLED;
+    verifyProfile("X25519", "ecdsa_secp256r1_sha256", false, &options);
+    ASSERT_FALSE(HasFatalFailure());
+    for (auto peer : peers) {
+        auto* session = ((PKvsPeerConnection) peer)->pDtlsSession;
+        MUTEX_LOCK(session->sslLock);
+        const long cacheMode = SSL_CTX_get_session_cache_mode(session->pSslCtx);
+        EXPECT_EQ(0, cacheMode & SSL_SESS_CACHE_SERVER);
+        EXPECT_NE(0, cacheMode & SSL_SESS_CACHE_NO_INTERNAL_STORE);
+        EXPECT_EQ(0u, SSL_get_num_tickets(session->pSsl));
+        EXPECT_EQ(0u, SSL_get_max_early_data(session->pSsl));
+        EXPECT_EQ(0u, SSL_get_recv_max_early_data(session->pSsl));
+        SSL_SESSION* negotiated = SSL_get_session(session->pSsl);
+        EXPECT_NE(nullptr, negotiated);
+        if (negotiated != nullptr) {
+            EXPECT_EQ(0, SSL_SESSION_has_ticket(negotiated));
+            EXPECT_EQ(0, SSL_SESSION_is_resumable(negotiated));
+        }
+        MUTEX_UNLOCK(session->sslLock);
+    }
+}
+
 class DtlsPqcRejectionTest : public WebRtcClientTestBase {
   protected:
     struct PacketQueue {
@@ -304,6 +500,7 @@ class DtlsPqcRejectionTest : public WebRtcClientTestBase {
     };
     PacketQueue inbound[2];
     PDtlsSession sessions[2] = {nullptr, nullptr};
+    std::atomic<UINT32> receivedTickets[2]{{0}, {0}};
     TIMER_QUEUE_HANDLE timer = INVALID_TIMER_QUEUE_HANDLE_VALUE;
 
     void TearDown() override
@@ -318,14 +515,18 @@ class DtlsPqcRejectionTest : public WebRtcClientTestBase {
     }
 
     void handshake(PRtcDtlsConfiguration clientConfig, PRtcDtlsConfiguration serverConfig, bool expectConnection = false,
-                   bool dropServerPacket = false, bool stopBeforeFinalAck = false)
+                   bool dropServerPacket = false, bool stopBeforeFinalAck = false,
+                   const RtcDtlsOptions* clientOptions = nullptr, const RtcDtlsOptions* serverOptions = nullptr,
+                   bool issueServerTickets = false)
     {
         ASSERT_EQ(STATUS_SUCCESS, timerQueueCreate(&timer));
         inbound[0].dropNext = dropServerPacket;
         PRtcDtlsConfiguration configs[] = {clientConfig, serverConfig};
+        const RtcDtlsOptions* dtlsOptions[] = {clientOptions, serverOptions};
         for (UINT32 i = 0; i < 2; ++i) {
             DtlsSessionOptions options{};
             options.pDtlsConfiguration = configs[i];
+            options.pDtlsOptions = dtlsOptions[i];
             DtlsSessionCallbacks callbacks{};
             callbacks.outBoundPacketFnCustomData = (UINT64) &inbound[1 - i];
             callbacks.outboundPacketFn = [](UINT64 data, PBYTE packet, UINT32 length) {
@@ -339,6 +540,21 @@ class DtlsPqcRejectionTest : public WebRtcClientTestBase {
                 queue->packets.emplace(packet, packet + length);
             };
             ASSERT_EQ(STATUS_SUCCESS, createDtlsSessionWithOptions(&callbacks, timer, 0, FALSE, nullptr, &options, &sessions[i]));
+            SSL_set_msg_callback_arg(sessions[i]->pSsl, &receivedTickets[i]);
+            SSL_set_msg_callback(sessions[i]->pSsl,
+                                 [](int write, int, int contentType, const void* buffer, size_t length, SSL*, void* data) {
+                                     if (!write && contentType == SSL3_RT_HANDSHAKE && length != 0 &&
+                                         ((const BYTE*) buffer)[0] == SSL3_MT_NEWSESSION_TICKET) {
+                                         ((std::atomic<UINT32>*) data)->fetch_add(1);
+                                     }
+                                 });
+        }
+        if (issueServerTickets) {
+            // OpenSSL suppresses tickets with client-certificate verification and no session-ID context.
+            // Configure only the controlled remote issuer; retain every disabled-client setting.
+            const BYTE context[] = "test-ticket-issuer";
+            ASSERT_EQ(1, SSL_set_session_id_context(sessions[1]->pSsl, context, SIZEOF(context) - 1));
+            ASSERT_EQ(1, SSL_set_num_tickets(sessions[1]->pSsl, 2));
         }
         ASSERT_EQ(STATUS_SUCCESS, dtlsSessionStart(sessions[1], TRUE));
         ASSERT_EQ(STATUS_SUCCESS, dtlsSessionStart(sessions[0], FALSE));
@@ -397,6 +613,54 @@ TEST_F(DtlsPqcRejectionTest, explicitDtls13CannotDowngradeToDtls12)
 {
     RtcDtlsConfiguration dtls{"X25519", "ecdsa_secp256r1_sha256"};
     handshake(&dtls, nullptr);
+}
+
+TEST_F(DtlsPqcRejectionTest, disjointCipherSuitesCannotUseBackendDefaults)
+{
+    RtcDtlsConfiguration dtls{"X25519", "ecdsa_secp256r1_sha256"};
+    RtcDtlsOptions client{};
+    client.structSize = SIZEOF(client);
+    client.pCipherSuites = "TLS_AES_128_GCM_SHA256";
+    RtcDtlsOptions server{};
+    server.structSize = SIZEOF(server);
+    server.pCipherSuites = "TLS_AES_256_GCM_SHA384";
+    handshake(&dtls, &dtls, false, false, false, &client, &server);
+}
+
+TEST_F(DtlsPqcRejectionTest, disabledTicketsCannotRetainAnUnsolicitedTicketForReuse)
+{
+    RtcDtlsConfiguration dtls{"X25519", "ecdsa_secp256r1_sha256"};
+    RtcDtlsOptions client{};
+    client.structSize = SIZEOF(client);
+    client.tickets = RTC_DTLS_OPTION_DISABLED;
+    // The controlled remote has the session-ID context required to actually issue tickets.
+    handshake(&dtls, &dtls, true, false, false, &client, nullptr, true);
+    ASSERT_FALSE(HasFatalFailure());
+    const UINT64 deadline = GETTIME() + 2 * HUNDREDS_OF_NANOS_IN_A_SECOND;
+    while (GETTIME() < deadline && receivedTickets[0].load() == 0) {
+        for (UINT32 i = 0; i < 2; ++i) {
+            std::queue<std::vector<BYTE>> packets;
+            {
+                std::lock_guard<std::mutex> lock(inbound[i].mutex);
+                packets.swap(inbound[i].packets);
+            }
+            while (!packets.empty()) {
+                INT32 length = packets.front().size();
+                ASSERT_EQ(STATUS_SUCCESS, dtlsSessionProcessPacket(sessions[i], packets.front().data(), &length));
+                packets.pop();
+            }
+        }
+        THREAD_SLEEP(10 * HUNDREDS_OF_NANOS_IN_A_MILLISECOND);
+    }
+    ASSERT_GT(receivedTickets[0].load(), 0u) << "The test must deliver an actual unsolicited NewSessionTicket";
+    MUTEX_LOCK(sessions[0]->sslLock);
+    SSL_SESSION* current = SSL_get_session(sessions[0]->pSsl);
+    EXPECT_NE(nullptr, current);
+    if (current != nullptr) {
+        EXPECT_EQ(0, SSL_SESSION_is_resumable(current));
+    }
+    EXPECT_EQ(0, SSL_CTX_sess_number(sessions[0]->pSslCtx));
+    MUTEX_UNLOCK(sessions[0]->sslLock);
 }
 
 TEST_F(DtlsPqcRejectionTest, hybridHandshakeRetransmitsDroppedServerDatagram)
@@ -477,6 +741,20 @@ TEST_F(DtlsPqcTest, unsupportedBackendRejectsExplicitDtlsConfiguration)
     if (peer != nullptr) {
         freePeerConnection(&peer);
         FAIL() << "An unsupported DTLS configuration created a peer";
+    }
+}
+
+TEST_F(DtlsPqcTest, unsupportedBackendRejectsExplicitDtlsOptions)
+{
+    RtcConfiguration config{};
+    RtcDtlsConfiguration dtls{"X25519", "ecdsa_secp256r1_sha256"};
+    RtcDtlsOptions options{};
+    options.structSize = SIZEOF(options);
+    PRtcPeerConnection peer = nullptr;
+    EXPECT_EQ(STATUS_NOT_IMPLEMENTED, createPeerConnectionWithDtlsOptions(&config, &dtls, &options, &peer));
+    if (peer != nullptr) {
+        freePeerConnection(&peer);
+        FAIL() << "An unsupported DTLS options request created a peer";
     }
 }
 

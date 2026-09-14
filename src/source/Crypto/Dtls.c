@@ -98,6 +98,20 @@ STATUS dtlsSessionCopyOptions(PDtlsSession pDtlsSession, PDtlsSessionOptions pDt
 
     CHK(pDtlsSessionOptions != NULL, retStatus);
 
+    if (pDtlsSessionOptions->pDtlsOptions != NULL) {
+        const RtcDtlsOptions* pOptions = pDtlsSessionOptions->pDtlsOptions;
+        CHK(pOptions->structSize == SIZEOF(RtcDtlsOptions), STATUS_INVALID_ARG);
+        CHK(pDtlsSessionOptions->pDtlsConfiguration != NULL, STATUS_NULL_ARG);
+        CHK((UINT32) pOptions->resumption <= RTC_DTLS_OPTION_ENABLED && (UINT32) pOptions->tickets <= RTC_DTLS_OPTION_ENABLED &&
+                (UINT32) pOptions->earlyData <= RTC_DTLS_OPTION_ENABLED,
+            STATUS_INVALID_ARG);
+        CHK(pOptions->pCipherSuites == NULL || pOptions->pCipherSuites[0] != '\0', STATUS_INVALID_ARG);
+        // Session transfer/server continuity and early-data I/O are not provided by this SDK boundary.
+        CHK(pOptions->resumption != RTC_DTLS_OPTION_ENABLED && pOptions->tickets != RTC_DTLS_OPTION_ENABLED &&
+                pOptions->earlyData != RTC_DTLS_OPTION_ENABLED,
+            STATUS_NOT_IMPLEMENTED);
+    }
+
     if (pDtlsSessionOptions->pDtlsConfiguration != NULL) {
 #if !defined(KVS_USE_OPENSSL) || !defined(DTLS1_3_VERSION) || defined(OPENSSL_NO_DTLS1_3)
         CHK(FALSE, STATUS_NOT_IMPLEMENTED);
@@ -125,6 +139,94 @@ CleanUp:
     CHK_LOG_ERR(retStatus);
     LEAVES();
     return retStatus;
+}
+
+#if defined(KVS_USE_OPENSSL) && (OPENSSL_VERSION_NUMBER >= 0x30200000L || (defined(SSL_get0_signature_name) && defined(SSL_get0_peer_signature_name)))
+static STATUS dtlsCopyAlgorithmName(const CHAR* pName, PCHAR pDestination, UINT32 validField, PRtcDtlsInfo pInfo)
+{
+    SIZE_T length;
+    if (pName == NULL || pName[0] == '\0') {
+        return STATUS_SUCCESS;
+    }
+    length = STRNLEN(pName, RTC_DTLS_ALGORITHM_NAME_MAX_LEN + 1);
+    if (length > RTC_DTLS_ALGORITHM_NAME_MAX_LEN) {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    MEMCPY(pDestination, pName, length + 1);
+    pInfo->validFields |= validField;
+    return STATUS_SUCCESS;
+}
+#endif
+
+STATUS dtlsSessionGetInfo(PDtlsSession pDtlsSession, PRtcDtlsInfo pInfo)
+{
+#ifdef KVS_USE_OPENSSL
+    STATUS retStatus = STATUS_SUCCESS;
+    const SSL_CIPHER* pCipher = NULL;
+    BOOL locked = FALSE;
+
+    CHK(pDtlsSession != NULL && pInfo != NULL, STATUS_NULL_ARG);
+    MUTEX_LOCK(pDtlsSession->sslLock);
+    locked = TRUE;
+    CHK(!ATOMIC_LOAD_BOOL(&pDtlsSession->isShutdown) && !ATOMIC_LOAD_BOOL(&pDtlsSession->isCleanUp) &&
+            pDtlsSession->state != RTC_DTLS_TRANSPORT_STATE_CLOSED && pDtlsSession->state != RTC_DTLS_TRANSPORT_STATE_FAILED &&
+            SSL_is_init_finished(pDtlsSession->pSsl),
+        STATUS_INVALID_OPERATION);
+
+    pInfo->protocolVersion = (UINT16) SSL_version(pDtlsSession->pSsl);
+    pInfo->sessionResumed = SSL_session_reused(pDtlsSession->pSsl) != 0;
+    pInfo->validFields |= RTC_DTLS_INFO_PROTOCOL | RTC_DTLS_INFO_SESSION_REUSED;
+    pCipher = SSL_get_current_cipher(pDtlsSession->pSsl);
+    if (pCipher != NULL) {
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+        pInfo->cipherSuite = SSL_CIPHER_get_protocol_id(pCipher);
+#else
+        pInfo->cipherSuite = (UINT16) (SSL_CIPHER_get_id(pCipher) & 0xffff);
+#endif
+        pInfo->validFields |= RTC_DTLS_INFO_CIPHER;
+    }
+    if (!pInfo->sessionResumed) {
+#if OPENSSL_VERSION_NUMBER >= 0x30200000L
+        CHK_STATUS(dtlsCopyAlgorithmName(SSL_get0_group_name(pDtlsSession->pSsl), pInfo->group, RTC_DTLS_INFO_GROUP, pInfo));
+#endif
+#if defined(SSL_get0_signature_name) && defined(SSL_get0_peer_signature_name)
+        const CHAR* pName = NULL;
+        if (SSL_get0_signature_name(pDtlsSession->pSsl, &pName) == 1) {
+            CHK_STATUS(dtlsCopyAlgorithmName(pName, pInfo->localSignatureAlgorithm, RTC_DTLS_INFO_LOCAL_SIGNATURE, pInfo));
+        }
+        pName = NULL;
+        if (SSL_get0_peer_signature_name(pDtlsSession->pSsl, &pName) == 1) {
+            CHK_STATUS(dtlsCopyAlgorithmName(pName, pInfo->remoteSignatureAlgorithm, RTC_DTLS_INFO_REMOTE_SIGNATURE, pInfo));
+        }
+#endif
+    }
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+    switch (SSL_get_early_data_status(pDtlsSession->pSsl)) {
+        case SSL_EARLY_DATA_NOT_SENT:
+            pInfo->earlyDataStatus = RTC_DTLS_EARLY_DATA_NOT_SENT;
+            break;
+        case SSL_EARLY_DATA_REJECTED:
+            pInfo->earlyDataStatus = RTC_DTLS_EARLY_DATA_REJECTED;
+            break;
+        case SSL_EARLY_DATA_ACCEPTED:
+            pInfo->earlyDataStatus = RTC_DTLS_EARLY_DATA_ACCEPTED;
+            break;
+    }
+    if (pInfo->earlyDataStatus != RTC_DTLS_EARLY_DATA_UNKNOWN) {
+        pInfo->validFields |= RTC_DTLS_INFO_EARLY_DATA;
+    }
+#endif
+
+CleanUp:
+    if (locked) {
+        MUTEX_UNLOCK(pDtlsSession->sslLock);
+    }
+    return retStatus;
+#else
+    UNUSED_PARAM(pDtlsSession);
+    UNUSED_PARAM(pInfo);
+    return STATUS_NOT_IMPLEMENTED;
+#endif
 }
 
 STATUS dtlsFillPseudoRandomBits(PBYTE pBuf, UINT32 bufSize)

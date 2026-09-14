@@ -718,6 +718,9 @@ VOID onDtlsStateChange(UINT64 customData, RTC_DTLS_TRANSPORT_STATE newDtlsState)
         case RTC_DTLS_TRANSPORT_STATE_CLOSED:
             changePeerConnectionState(pKvsPeerConnection, RTC_PEER_CONNECTION_STATE_CLOSED);
             break;
+        case RTC_DTLS_TRANSPORT_STATE_FAILED:
+            changePeerConnectionState(pKvsPeerConnection, RTC_PEER_CONNECTION_STATE_FAILED);
+            break;
         default:
             /* explicit ignore */
             break;
@@ -1020,6 +1023,12 @@ STATUS createPeerConnection(PRtcConfiguration pConfiguration, PRtcPeerConnection
 STATUS createPeerConnectionWithDtlsConfiguration(PRtcConfiguration pConfiguration, PRtcDtlsConfiguration pDtlsConfiguration,
                                                  PRtcPeerConnection* ppPeerConnection)
 {
+    return createPeerConnectionWithDtlsOptions(pConfiguration, pDtlsConfiguration, NULL, ppPeerConnection);
+}
+
+STATUS createPeerConnectionWithDtlsOptions(PRtcConfiguration pConfiguration, PRtcDtlsConfiguration pDtlsConfiguration,
+                                         const RtcDtlsOptions* pDtlsOptions, PRtcPeerConnection* ppPeerConnection)
+{
     ENTERS();
     STATUS retStatus = STATUS_SUCCESS;
     PKvsPeerConnection pKvsPeerConnection = NULL;
@@ -1030,14 +1039,16 @@ STATUS createPeerConnectionWithDtlsConfiguration(PRtcConfiguration pConfiguratio
     UINT64 startTime = 0;
     UINT64 startTimeInMacro = 0;
 
-    CHK(pConfiguration != NULL && ppPeerConnection != NULL, STATUS_NULL_ARG);
+    CHK(ppPeerConnection != NULL, STATUS_NULL_ARG);
     *ppPeerConnection = NULL;
+    CHK(pConfiguration != NULL, STATUS_NULL_ARG);
 
     startTime = GETTIME();
     MEMSET(&iceAgentCallbacks, 0, SIZEOF(IceAgentCallbacks));
     MEMSET(&dtlsSessionCallbacks, 0, SIZEOF(DtlsSessionCallbacks));
     MEMSET(&dtlsSessionOptions, 0, SIZEOF(dtlsSessionOptions));
     dtlsSessionOptions.pDtlsConfiguration = pDtlsConfiguration;
+    dtlsSessionOptions.pDtlsOptions = pDtlsOptions;
 
     pKvsPeerConnection = (PKvsPeerConnection) MEMCALLOC(1, SIZEOF(KvsPeerConnection));
     CHK(pKvsPeerConnection != NULL, STATUS_NOT_ENOUGH_MEMORY);
@@ -1111,6 +1122,28 @@ CleanUp:
     }
 
     LEAVES();
+    return retStatus;
+}
+
+STATUS getPeerConnectionDtlsInfo(PRtcPeerConnection pPeerConnection, PRtcDtlsInfo pInfo)
+{
+    STATUS retStatus = STATUS_SUCCESS;
+    PKvsPeerConnection pKvsPeerConnection = (PKvsPeerConnection) pPeerConnection;
+
+    CHK(pInfo != NULL, STATUS_NULL_ARG);
+    CHK(pInfo->structSize == SIZEOF(RtcDtlsInfo), STATUS_INVALID_ARG);
+    MEMSET(pInfo, 0, SIZEOF(*pInfo));
+    pInfo->structSize = SIZEOF(*pInfo);
+    CHK(pKvsPeerConnection != NULL, STATUS_NULL_ARG);
+    // closePeerConnection shuts ICE down even when DTLS has not completed yet.
+    CHK(!ATOMIC_LOAD_BOOL(&pKvsPeerConnection->pIceAgent->shutdown), STATUS_INVALID_OPERATION);
+    retStatus = dtlsSessionGetInfo(pKvsPeerConnection->pDtlsSession, pInfo);
+    if (STATUS_FAILED(retStatus)) {
+        MEMSET(pInfo, 0, SIZEOF(*pInfo));
+        pInfo->structSize = SIZEOF(*pInfo);
+    }
+
+CleanUp:
     return retStatus;
 }
 

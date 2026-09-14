@@ -84,6 +84,7 @@ typedef struct {
     DTLS_SESSION_VALIDATION_MODE validationMode;
     PCHAR pExpectedServerHostname;
     PRtcDtlsConfiguration pDtlsConfiguration;
+    const RtcDtlsOptions* pDtlsOptions;
 } DtlsSessionOptions, *PDtlsSessionOptions;
 
 // DtlsKeyingMaterial is information extracted via https://tools.ietf.org/html/rfc5705
@@ -221,6 +222,7 @@ STATUS dtlsSessionChangeState(PDtlsSession, RTC_DTLS_TRANSPORT_STATE);
  * Strict server validation requires a non-empty expected hostname.
  */
 STATUS dtlsSessionCopyOptions(PDtlsSession, PDtlsSessionOptions);
+STATUS dtlsSessionGetInfo(PDtlsSession, PRtcDtlsInfo);
 
 STATUS dtlsFillPseudoRandomBits(PBYTE, UINT32);
 

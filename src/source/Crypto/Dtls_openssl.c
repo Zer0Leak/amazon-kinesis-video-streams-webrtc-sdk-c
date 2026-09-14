@@ -430,6 +430,16 @@ STATUS createDtlsSession(PDtlsSessionCallbacks pDtlsSessionCallbacks, TIMER_QUEU
                                         ppDtlsSession);
 }
 
+#if defined(DTLS1_3_VERSION) && !defined(OPENSSL_NO_DTLS1_3)
+static int dtlsDiscardResumableSession(SSL* pSsl, SSL_SESSION* pSession)
+{
+    // Cache OFF alone still leaves received tickets attached to the live SSL session.
+    // Removal marks it non-resumable even when not cached; preserve live handshake metadata.
+    SSL_CTX_remove_session(SSL_get_SSL_CTX(pSsl), pSession);
+    return 0; // Release OpenSSL's extra callback reference, not the live session reference.
+}
+#endif
+
 STATUS createDtlsSessionWithOptions(PDtlsSessionCallbacks pDtlsSessionCallbacks, TIMER_QUEUE_HANDLE timerQueueHandle, INT32 certificateBits,
                                     BOOL generateRSACertificate, PRtcCertificate pRtcCertificates, PDtlsSessionOptions pDtlsSessionOptions,
                                     PDtlsSession* ppDtlsSession)
@@ -487,6 +497,7 @@ STATUS createDtlsSessionWithOptions(PDtlsSessionCallbacks pDtlsSessionCallbacks,
 #if defined(DTLS1_3_VERSION) && !defined(OPENSSL_NO_DTLS1_3)
     if (pDtlsSessionOptions != NULL && pDtlsSessionOptions->pDtlsConfiguration != NULL) {
         PRtcDtlsConfiguration pConfig = pDtlsSessionOptions->pDtlsConfiguration;
+        const RtcDtlsOptions* pOptions = pDtlsSessionOptions->pDtlsOptions;
         // SDP currently advertises a single local fingerprint. Avoid ambiguous certificate selection.
         CHK(pDtlsSession->certificateCount == 1, STATUS_INVALID_ARG);
         CHK(SSL_CTX_set_max_proto_version(pDtlsSession->pSslCtx, DTLS1_3_VERSION) == 1 &&
@@ -494,6 +505,23 @@ STATUS createDtlsSessionWithOptions(PDtlsSessionCallbacks pDtlsSessionCallbacks,
                 SSL_CTX_set1_groups_list(pDtlsSession->pSslCtx, pConfig->pGroups) == 1 &&
                 SSL_CTX_set1_sigalgs_list(pDtlsSession->pSslCtx, pConfig->pSignatureAlgorithms) == 1,
             STATUS_INVALID_ARG);
+        if (pOptions != NULL) {
+            if (pOptions->pCipherSuites != NULL) {
+                CHK(SSL_CTX_set_ciphersuites(pDtlsSession->pSslCtx, pOptions->pCipherSuites) == 1, STATUS_INVALID_ARG);
+            }
+            if (pOptions->resumption == RTC_DTLS_OPTION_DISABLED || pOptions->tickets == RTC_DTLS_OPTION_DISABLED) {
+                // No server cache lookup/store, client session import or reusable received tickets.
+                SSL_CTX_set_session_cache_mode(pDtlsSession->pSslCtx, SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_NO_INTERNAL);
+                SSL_CTX_sess_set_new_cb(pDtlsSession->pSslCtx, dtlsDiscardResumableSession);
+                SSL_CTX_set_options(pDtlsSession->pSslCtx, SSL_OP_NO_TICKET);
+                CHK(SSL_CTX_set_num_tickets(pDtlsSession->pSslCtx, 0) == 1, STATUS_SSL_CTX_CREATION_FAILED);
+            }
+            if (pOptions->earlyData == RTC_DTLS_OPTION_DISABLED) {
+                CHK(SSL_CTX_set_max_early_data(pDtlsSession->pSslCtx, 0) == 1 &&
+                        SSL_CTX_set_recv_max_early_data(pDtlsSession->pSslCtx, 0) == 1,
+                    STATUS_SSL_CTX_CREATION_FAILED);
+            }
+        }
     }
 #endif
     PROFILE_CALL(CHK_STATUS(createSsl(pDtlsSession->pSslCtx, &pDtlsSession->pSsl)), "Create SSL session");

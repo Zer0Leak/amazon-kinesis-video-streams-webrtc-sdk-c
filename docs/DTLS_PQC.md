@@ -78,6 +78,45 @@ Existing public configuration structures are unchanged, and no OpenSSL types
 are added to public function signatures. The configuration and strings are
 consumed during creation and can then be released.
 
+### Additional options and negotiated results
+
+`createPeerConnectionWithDtlsOptions()` reuses the same configuration and adds
+a cipher-suite list and explicit session controls:
+
+```c
+RtcDtlsOptions options = {0};
+options.structSize = sizeof(options);
+options.pCipherSuites = "TLS_AES_256_GCM_SHA384";
+options.resumption = RTC_DTLS_OPTION_DISABLED;
+options.tickets = RTC_DTLS_OPTION_DISABLED;
+options.earlyData = RTC_DTLS_OPTION_DISABLED;
+status = createPeerConnectionWithDtlsOptions(&config, &dtls, &options, &peer);
+```
+
+NULL options preserve the existing creation behavior. Non-NULL options require
+a DTLS configuration. Each control accepts DEFAULT, DISABLED or ENABLED;
+DEFAULT preserves backend behavior and DISABLED enforces the prohibition.
+All three ENABLED settings currently return `STATUS_NOT_IMPLEMENTED`: session
+transfer and early application-data integration are not provided by this API.
+Disabling tickets/resumption suppresses issuance and makes received sessions
+unusable for reuse; live session metadata can remain until peer destruction.
+An explicit prohibition can constrain related DEFAULT mechanisms.
+
+After handshake completion, an application worker can call
+`getPeerConnectionDtlsInfo()` with `RtcDtlsInfo.structSize = sizeof(RtcDtlsInfo)`.
+It copies the actual protocol/cipher wire values, group and handshake signature
+names, session-reuse flag and early-data outcome. Check `validFields` before
+using any observation. The result contains no backend pointers and survives
+peer destruction. Missing observations have no validity bit; oversized names
+fail without truncation. A successful query does not establish peer trust.
+
+Call the getter outside SDK callbacks and serialize it with close/free. Before
+completion or after close it returns `STATUS_INVALID_OPERATION`. Errors clear
+a correctly sized result while preserving its size; invalid sizes leave the
+record untouched. The existing public structures and constructors retain their
+layouts and signatures. Profile selection, credential policy and application
+admission belong to the application layer.
+
 ## Supplying an ML-DSA certificate
 
 Use the existing `RtcConfiguration.certificates` field. In the OpenSSL backend,
@@ -141,12 +180,17 @@ Run the local integration and regression tests without AWS credentials:
 
 ```sh
 build-openssl41/tst/webrtc_client_test \
-  --gtest_filter='DtlsPqc*.*:DtlsApiTest.*:DtlsFunctionalityTest.*'
+  --gtest_filter='DtlsPqc*.*:DtlsApiTest.*:DtlsFunctionalityTest.*:PeerConnectionApiTest.*:SrtpApiTest.*:DataChannelApiTest.*:DataChannelFunctionalityTest.*'
 ```
 
-Validated on Linux with OpenSSL 4.1.0-alpha1: all 10 new tests and 36 existing
-DTLS, peer API, SRTP, and data-channel regression tests pass. The three profiles
-negotiate the expected algorithms over local ICE, exchange 4096-byte messages
-in both directions, and encrypt/decrypt SRTP using the negotiated keys. Tests
-also cover packet loss, data arriving before the final ACK, incompatible
-algorithms, and rejection of DTLS 1.2 downgrade.
+Validated on Linux with OpenSSL 4.1.0-alpha1: **54 selected tests pass**, including
+18 native DTLS cases and 36 existing DTLS, peer API, SRTP and DataChannel cases.
+The native cases cover algorithm negotiation over local ICE, bidirectional
+4096-byte messages, SRTP, packet loss, final-ACK handling, incompatible offers,
+DTLS 1.2 downgrade rejection, typed options, copied results and actual received
+ticket invalidation. The installed public SDK also passes 14 application-layer
+fixture cases and C11/C++11 consumer checks, including an old-header C consumer
+against the new shared library. See the [execution record](../outputs/minimal-dtls-options-20260914T230219Z/implementation.md)
+for exact commands, retained failed attempts and limits. This is shared,
+statistics-OFF integration evidence; production trust policy and experiment
+treatments remain unqualified.

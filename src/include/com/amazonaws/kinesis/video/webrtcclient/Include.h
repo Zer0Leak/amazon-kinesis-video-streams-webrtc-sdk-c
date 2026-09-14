@@ -1436,6 +1436,50 @@ typedef struct {
     const CHAR* pSignatureAlgorithms; //!< For example "ecdsa_secp256r1_sha256" or "mldsa65".
 } RtcDtlsConfiguration, *PRtcDtlsConfiguration;
 
+/** Generic per-connection controls; DEFAULT preserves the existing SDK behavior. */
+typedef enum {
+    RTC_DTLS_OPTION_DEFAULT = 0,
+    RTC_DTLS_OPTION_DISABLED = 1,
+    RTC_DTLS_OPTION_ENABLED = 2
+} RTC_DTLS_OPTION;
+
+typedef struct {
+    UINT32 structSize;         //!< Set to sizeof(RtcDtlsOptions); unsupported sizes reject.
+    const CHAR* pCipherSuites; //!< NULL preserves defaults; otherwise a nonempty OpenSSL TLS 1.3 cipher-suite list.
+    RTC_DTLS_OPTION resumption;
+    RTC_DTLS_OPTION tickets;
+    RTC_DTLS_OPTION earlyData;
+} RtcDtlsOptions, *PRtcDtlsOptions;
+
+#define RTC_DTLS_INFO_PROTOCOL          0x01U
+#define RTC_DTLS_INFO_CIPHER            0x02U
+#define RTC_DTLS_INFO_GROUP             0x04U
+#define RTC_DTLS_INFO_LOCAL_SIGNATURE   0x08U
+#define RTC_DTLS_INFO_REMOTE_SIGNATURE  0x10U
+#define RTC_DTLS_INFO_SESSION_REUSED    0x20U
+#define RTC_DTLS_INFO_EARLY_DATA        0x40U
+#define RTC_DTLS_ALGORITHM_NAME_MAX_LEN 127U
+
+typedef enum {
+    RTC_DTLS_EARLY_DATA_UNKNOWN = 0,
+    RTC_DTLS_EARLY_DATA_NOT_SENT = 1,
+    RTC_DTLS_EARLY_DATA_REJECTED = 2,
+    RTC_DTLS_EARLY_DATA_ACCEPTED = 3
+} RTC_DTLS_EARLY_DATA_STATUS;
+
+/** Copied backend observations, not a certificate/trust-policy verdict. */
+typedef struct {
+    UINT32 structSize;       //!< Set to sizeof(RtcDtlsInfo).
+    UINT32 validFields;      //!< Only fields with the corresponding RTC_DTLS_INFO_* bit are observations.
+    UINT16 protocolVersion; //!< Negotiated protocol value, in host byte order.
+    UINT16 cipherSuite;     //!< IANA cipher-suite value, in host byte order.
+    CHAR group[RTC_DTLS_ALGORITHM_NAME_MAX_LEN + 1];
+    CHAR localSignatureAlgorithm[RTC_DTLS_ALGORITHM_NAME_MAX_LEN + 1];
+    CHAR remoteSignatureAlgorithm[RTC_DTLS_ALGORITHM_NAME_MAX_LEN + 1];
+    BOOL sessionResumed; //!< FALSE means full handshake only when RTC_DTLS_INFO_SESSION_REUSED is valid.
+    RTC_DTLS_EARLY_DATA_STATUS earlyDataStatus;
+} RtcDtlsInfo, *PRtcDtlsInfo;
+
 /**
  *  KvsRtcConfiguration is a collection of non-standard extensions to RTCConfiguration
  *  these exist to serve use cases that currently aren't being served by the W3C standard
@@ -1925,6 +1969,32 @@ PUBLIC_API STATUS createPeerConnection(PRtcConfiguration, PRtcPeerConnection*);
  * Existing configuration structures and createPeerConnection's ABI are unchanged.
  */
 PUBLIC_API STATUS createPeerConnectionWithDtlsConfiguration(PRtcConfiguration, PRtcDtlsConfiguration, PRtcPeerConnection*);
+
+/**
+ * @brief Create a peer with explicit DTLS 1.3 algorithms and optional cipher/session controls.
+ * NULL options preserves createPeerConnectionWithDtlsConfiguration behavior. Non-NULL options
+ * require non-NULL DTLS configuration and structSize == sizeof(RtcDtlsOptions).
+ * Inputs, strings and certificate/key objects may be freed after creation; no input pointers are retained.
+ * DEFAULT preserves behavior, DISABLED enforces prohibition, ENABLED requires usable integration.
+ * The current integration rejects ENABLED session controls with STATUS_NOT_IMPLEMENTED.
+ * Disabled tickets are not issued or retained for reuse; unusable session metadata may remain until free.
+ * Invalid sizes/enums or rejected lists return STATUS_INVALID_ARG; unavailable backends/mechanisms return
+ * STATUS_NOT_IMPLEMENTED. Failure sets a valid output peer pointer to NULL and releases partial state.
+ */
+PUBLIC_API STATUS createPeerConnectionWithDtlsOptions(PRtcConfiguration, PRtcDtlsConfiguration, const RtcDtlsOptions*, PRtcPeerConnection*);
+
+/**
+ * @brief Copy negotiated DTLS observations into caller-owned storage.
+ * Set structSize == sizeof(RtcDtlsInfo). Call outside SDK callbacks, serialized with close/free.
+ * Before handshake completion, on a failed DTLS session or after close: STATUS_INVALID_OPERATION.
+ * Unsupported backends return STATUS_NOT_IMPLEMENTED. Missing fields remain zero with their validity bit clear;
+ * resumed handshakes do not report cached group/signatures as new exchanges. Group/signature strings are names,
+ * not OpenSSL NIDs. Early-data NOT_SENT does not establish that early data was disabled.
+ * Names are never truncated: an oversized name returns STATUS_BUFFER_TOO_SMALL.
+ * On failure a correctly sized output is cleared except structSize; an invalid size is left untouched.
+ * No backend pointers are returned. Results remain valid after another query or peer destruction.
+ */
+PUBLIC_API STATUS getPeerConnectionDtlsInfo(PRtcPeerConnection, PRtcDtlsInfo);
 
 /**
  * @brief Free a RtcPeerConnection

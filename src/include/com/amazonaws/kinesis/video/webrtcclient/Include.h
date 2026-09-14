@@ -1426,6 +1426,17 @@ typedef struct {
 } RtcCertificate, *PRtcCertificate;
 
 /**
+ * @brief Explicit DTLS 1.3 algorithms for createPeerConnectionWithDtlsConfiguration.
+ * Both strings are required, use OpenSSL list syntax, and are consumed during creation.
+ * Only listed algorithms are offered; include only PQC groups/signatures to require PQC.
+ * Authentication keys are supplied through RtcConfiguration.certificates, or default to ECDSA P-256.
+ */
+typedef struct {
+    const CHAR* pGroups;              //!< For example "X25519", "X25519MLKEM768", or "MLKEM768".
+    const CHAR* pSignatureAlgorithms; //!< For example "ecdsa_secp256r1_sha256" or "mldsa65".
+} RtcDtlsConfiguration, *PRtcDtlsConfiguration;
+
+/**
  *  KvsRtcConfiguration is a collection of non-standard extensions to RTCConfiguration
  *  these exist to serve use cases that currently aren't being served by the W3C standard
  *
@@ -1902,6 +1913,18 @@ PUBLIC_API STATUS configureTransceiverRollingBuffer(PRtcRtpTransceiver, PRtcMedi
  * @return STATUS code of the execution. STATUS_SUCCESS on success
  */
 PUBLIC_API STATUS createPeerConnection(PRtcConfiguration, PRtcPeerConnection*);
+
+/**
+ * @brief Create a peer with explicit DTLS 1.3 key exchange and authentication algorithms.
+ * A non-NULL DTLS configuration requires OpenSSL with DTLS 1.3 support; other backends
+ * return STATUS_NOT_IMPLEMENTED. Both peers must support the selected algorithms.
+ * There is no fallback to DTLS 1.2. NULL preserves createPeerConnection behavior.
+ * For PQC authentication, supply matching X509 and EVP_PKEY objects in certificates[0]
+ * (cast to PBYTE), rather than the default generated ECDSA certificate.
+ * The configuration, strings, and supplied certificate/key may be freed after this call.
+ * Existing configuration structures and createPeerConnection's ABI are unchanged.
+ */
+PUBLIC_API STATUS createPeerConnectionWithDtlsConfiguration(PRtcConfiguration, PRtcDtlsConfiguration, PRtcPeerConnection*);
 
 /**
  * @brief Free a RtcPeerConnection

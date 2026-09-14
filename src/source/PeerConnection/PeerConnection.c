@@ -172,6 +172,9 @@ VOID onInboundPacket(UINT64 customData, PBYTE buff, UINT32 buffLen)
     PKvsPeerConnection pKvsPeerConnection = (PKvsPeerConnection) customData;
     BOOL isDtlsConnected = FALSE;
     INT32 signedBuffLen = buffLen;
+#ifdef KVS_USE_OPENSSL
+    BYTE dtlsData[SSL3_RT_MAX_PLAIN_LENGTH];
+#endif
 
     CHK(signedBuffLen > 2 && pKvsPeerConnection != NULL, STATUS_SUCCESS);
 
@@ -187,7 +190,14 @@ VOID onInboundPacket(UINT64 customData, PBYTE buff, UINT32 buffLen)
                   +----------------+
     */
     if (buff[0] > 19 && buff[0] < 64) {
-        dtlsSessionProcessPacket(pKvsPeerConnection->pDtlsSession, buff, &signedBuffLen);
+#ifdef KVS_USE_OPENSSL
+        // A small ACK may release a previously buffered large application record.
+        signedBuffLen = SIZEOF(dtlsData);
+        CHK_STATUS(dtlsSessionProcessPacketWithBuffer(pKvsPeerConnection->pDtlsSession, buff, buffLen, dtlsData, &signedBuffLen));
+        buff = dtlsData;
+#else
+        CHK_STATUS(dtlsSessionProcessPacket(pKvsPeerConnection->pDtlsSession, buff, &signedBuffLen));
+#endif
 
         CHK_STATUS(dtlsSessionIsInitFinished(pKvsPeerConnection->pDtlsSession, &isDtlsConnected));
         if (isDtlsConnected) {
@@ -201,8 +211,14 @@ VOID onInboundPacket(UINT64 customData, PBYTE buff, UINT32 buffLen)
                     CHK_STATUS(allocateSctp(pKvsPeerConnection));
                 }
 
-                if (signedBuffLen > 0) {
+                while (signedBuffLen > 0) {
                     CHK_STATUS(putSctpPacket(pKvsPeerConnection->pSctpSession, buff, signedBuffLen));
+#ifdef KVS_USE_OPENSSL
+                    signedBuffLen = SIZEOF(dtlsData);
+                    CHK_STATUS(dtlsSessionProcessPacketWithBuffer(pKvsPeerConnection->pDtlsSession, NULL, 0, dtlsData, &signedBuffLen));
+#else
+                    break;
+#endif
                 }
             }
 #endif
@@ -998,20 +1014,30 @@ PVOID resolveStunIceServerIp(PVOID args)
 
 STATUS createPeerConnection(PRtcConfiguration pConfiguration, PRtcPeerConnection* ppPeerConnection)
 {
+    return createPeerConnectionWithDtlsConfiguration(pConfiguration, NULL, ppPeerConnection);
+}
+
+STATUS createPeerConnectionWithDtlsConfiguration(PRtcConfiguration pConfiguration, PRtcDtlsConfiguration pDtlsConfiguration,
+                                                 PRtcPeerConnection* ppPeerConnection)
+{
     ENTERS();
     STATUS retStatus = STATUS_SUCCESS;
     PKvsPeerConnection pKvsPeerConnection = NULL;
     IceAgentCallbacks iceAgentCallbacks;
     DtlsSessionCallbacks dtlsSessionCallbacks;
+    DtlsSessionOptions dtlsSessionOptions;
     PConnectionListener pConnectionListener = NULL;
     UINT64 startTime = 0;
     UINT64 startTimeInMacro = 0;
 
     CHK(pConfiguration != NULL && ppPeerConnection != NULL, STATUS_NULL_ARG);
+    *ppPeerConnection = NULL;
 
     startTime = GETTIME();
     MEMSET(&iceAgentCallbacks, 0, SIZEOF(IceAgentCallbacks));
     MEMSET(&dtlsSessionCallbacks, 0, SIZEOF(DtlsSessionCallbacks));
+    MEMSET(&dtlsSessionOptions, 0, SIZEOF(dtlsSessionOptions));
+    dtlsSessionOptions.pDtlsConfiguration = pDtlsConfiguration;
 
     pKvsPeerConnection = (PKvsPeerConnection) MEMCALLOC(1, SIZEOF(KvsPeerConnection));
     CHK(pKvsPeerConnection != NULL, STATUS_NOT_ENOUGH_MEMORY);
@@ -1024,9 +1050,10 @@ STATUS createPeerConnection(PRtcConfiguration pConfiguration, PRtcPeerConnection
     CHK_STATUS(generateJSONSafeString(pKvsPeerConnection->localIcePwd, LOCAL_ICE_PWD_LEN));
     CHK_STATUS(generateJSONSafeString(pKvsPeerConnection->localCNAME, LOCAL_CNAME_LEN));
 
-    PROFILE_CALL(CHK_STATUS(createDtlsSession(
-                     &dtlsSessionCallbacks, pKvsPeerConnection->timerQueueHandle, pConfiguration->kvsRtcConfiguration.generatedCertificateBits,
-                     pConfiguration->kvsRtcConfiguration.generateRSACertificate, pConfiguration->certificates, &pKvsPeerConnection->pDtlsSession)),
+    PROFILE_CALL(CHK_STATUS(createDtlsSessionWithOptions(&dtlsSessionCallbacks, pKvsPeerConnection->timerQueueHandle,
+                                                         pConfiguration->kvsRtcConfiguration.generatedCertificateBits,
+                                                         pConfiguration->kvsRtcConfiguration.generateRSACertificate, pConfiguration->certificates,
+                                                         &dtlsSessionOptions, &pKvsPeerConnection->pDtlsSession)),
                  "Create DTLS Session object");
     CHK_STATUS(dtlsSessionOnOutBoundData(pKvsPeerConnection->pDtlsSession, (UINT64) pKvsPeerConnection, onDtlsOutboundPacket));
     CHK_STATUS(dtlsSessionOnStateChange(pKvsPeerConnection->pDtlsSession, (UINT64) pKvsPeerConnection, onDtlsStateChange));

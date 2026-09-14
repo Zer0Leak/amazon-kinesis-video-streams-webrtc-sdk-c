@@ -11,7 +11,6 @@ project(KinesisVideoWebRTCClient VERSION 1.20.0 LANGUAGES C)
 option(ADD_MUCLIBC "Add -muclibc c flag" OFF)
 option(BUILD_DEPENDENCIES "Whether or not to build depending libraries from source" ON)
 option(USE_OPENSSL "Use openssl as crypto library" ON)
-option(USE_OPENSSL3 "Build/use OpenSSL 3.x (default: 1.1.1x). Auto-detected when using system OpenSSL 3.x." OFF)
 option(USE_MBEDTLS "Use mbedtls as crypto library" OFF)
 option(BUILD_STATIC_LIBS "Build all libraries statically. (This includes third-party libraries.)" OFF)
 
@@ -259,6 +258,11 @@ elseif(USE_MBEDTLS)
 endif()
 
 
+if(USE_OPENSSL AND NOT BUILD_DEPENDENCIES)
+  # Reject an older system OpenSSL before building any dependent libraries.
+  find_package(OpenSSL 4.1 REQUIRED)
+endif()
+
 if(BUILD_DEPENDENCIES OR BUILD_WEBSOCKETS OR BUILD_SRTP OR BUILD_USRSCTP)
   if(NOT EXISTS ${OPEN_SRC_INSTALL_PREFIX})
     file(MAKE_DIRECTORY ${OPEN_SRC_INSTALL_PREFIX})
@@ -283,8 +287,7 @@ if(BUILD_DEPENDENCIES OR BUILD_WEBSOCKETS OR BUILD_SRTP OR BUILD_USRSCTP)
       set(BUILD_ARGS -DBUILD_STATIC_LIBS=${BUILD_STATIC_LIBS}
                      -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
                      -DBUILD_OPENSSL_PLATFORM=${BUILD_OPENSSL_PLATFORM}
-                     -DOPENSSL_EXTRA=${OPENSSL_EXTRA}
-                     -DUSE_OPENSSL3=${USE_OPENSSL3})
+                     -DOPENSSL_EXTRA=${OPENSSL_EXTRA})
       build_dependency(openssl ${BUILD_ARGS})
       set(OPENSSL_ROOT_DIR ${OPEN_SRC_INSTALL_PREFIX})
     elseif(USE_MBEDTLS)
@@ -342,11 +345,11 @@ if(BUILD_DEPENDENCIES OR BUILD_WEBSOCKETS OR BUILD_SRTP OR BUILD_USRSCTP)
 
   # Find SSL libraries (needed by libwebsockets build args)
   if (USE_OPENSSL)
-    find_package(OpenSSL REQUIRED)
+    find_package(OpenSSL 4.1 REQUIRED)
     set(OPEN_SRC_INCLUDE_DIRS ${OPEN_SRC_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
 
     # Ensure downstream dependency builds (autotools and cmake) can find OpenSSL.
-    # OpenSSL 3.x installs to lib64/ on some platforms; we add both lib/ and lib64/
+    # OpenSSL installs to lib64/ on some platforms; we add both lib/ and lib64/
     # pkgconfig paths so pkg-config based builds (e.g. libsrtp) work correctly.
     set(ENV{PKG_CONFIG_PATH} "${OPEN_SRC_INSTALL_PREFIX}/lib64/pkgconfig:${OPEN_SRC_INSTALL_PREFIX}/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
   else()
@@ -433,16 +436,9 @@ build_dependency(kvsCommonLws ${BUILD_ARGS})
 find_package(Threads)
 find_package(PkgConfig REQUIRED)
 if (USE_OPENSSL)
-  find_package(OpenSSL REQUIRED)
+  find_package(OpenSSL 4.1 REQUIRED)
   set(OPEN_SRC_INCLUDE_DIRS ${OPEN_SRC_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
 
-  # Auto-detect OpenSSL 3.x from system when not already set
-  if(NOT USE_OPENSSL3)
-    if(OPENSSL_VERSION VERSION_GREATER_EQUAL "3.0.0")
-      message(STATUS "Auto-detected system OpenSSL ${OPENSSL_VERSION} (>= 3.0). Enabling USE_OPENSSL3.")
-      set(USE_OPENSSL3 ON)
-    endif()
-  endif()
 else()
   find_package(MbedTLS REQUIRED)
   set(OPEN_SRC_INCLUDE_DIRS ${OPEN_SRC_INCLUDE_DIRS} ${MBEDTLS_INCLUDE_DIRS})

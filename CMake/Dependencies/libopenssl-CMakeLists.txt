@@ -2,19 +2,14 @@ cmake_minimum_required(VERSION 3.6.3)
 
 project(libopenssl-download LANGUAGES C)
 
-# Select OpenSSL version based on USE_OPENSSL3 flag.
-# OpenSSL 3.x uses a different tag format: "openssl-X.Y.Z" vs "OpenSSL_X_Y_Zp"
-if(USE_OPENSSL3)
-  set(OPENSSL_GIT_TAG "openssl-3.5.7")
-else()
-  set(OPENSSL_GIT_TAG "OpenSSL_1_1_1t")
-endif()
+# DTLS 1.3 and PQC are supplied by this OpenSSL release for all OpenSSL builds.
+set(OPENSSL_GIT_TAG "openssl-4.1.0-alpha1")
 
 message(STATUS "Building OpenSSL from source: ${OPENSSL_GIT_TAG}")
 
 if (WIN32)
   find_program(MAKE_EXE NAMES nmake)
-  SET(CONFIGURE_COMMAND perl ${CMAKE_CURRENT_BINARY_DIR}/build/src/project_libopenssl/Configure VC-WIN64A no-asm --prefix=${OPEN_SRC_INSTALL_PREFIX} --openssldir=${OPEN_SRC_INSTALL_PREFIX})
+  SET(CONFIGURE_COMMAND perl ${CMAKE_CURRENT_BINARY_DIR}/build/src/project_libopenssl/Configure VC-WIN64A no-asm --prefix=${OPEN_SRC_INSTALL_PREFIX} --openssldir=${OPEN_SRC_INSTALL_PREFIX} --libdir=lib)
 else()
   find_program(MAKE_EXE NAMES make)
   # OpenSSL takes a while to compile, so allow some parallelism.
@@ -33,9 +28,9 @@ else()
   endif()
 
   if (DEFINED BUILD_OPENSSL_PLATFORM AND NOT BUILD_OPENSSL_PLATFORM STREQUAL OFF)
-    SET(CONFIGURE_COMMAND ${CMAKE_CURRENT_BINARY_DIR}/build/src/project_libopenssl/Configure ${OPENSSL_EXTRA} no-async --prefix=${OPEN_SRC_INSTALL_PREFIX} --openssldir=${OPEN_SRC_INSTALL_PREFIX} ${BUILD_OPENSSL_PLATFORM} -Wno-nullability-completeness -Wno-expansion-to-defined)
+    SET(CONFIGURE_COMMAND ${CMAKE_CURRENT_BINARY_DIR}/build/src/project_libopenssl/Configure ${OPENSSL_EXTRA} no-async --prefix=${OPEN_SRC_INSTALL_PREFIX} --openssldir=${OPEN_SRC_INSTALL_PREFIX} --libdir=lib ${BUILD_OPENSSL_PLATFORM} -Wno-nullability-completeness -Wno-expansion-to-defined)
   else()
-    SET(CONFIGURE_COMMAND ${CMAKE_CURRENT_BINARY_DIR}/build/src/project_libopenssl/config ${OPENSSL_EXTRA} --prefix=${OPEN_SRC_INSTALL_PREFIX} --openssldir=${OPEN_SRC_INSTALL_PREFIX} -Wno-nullability-completeness -Wno-expansion-to-defined)
+    SET(CONFIGURE_COMMAND ${CMAKE_CURRENT_BINARY_DIR}/build/src/project_libopenssl/config ${OPENSSL_EXTRA} --prefix=${OPEN_SRC_INSTALL_PREFIX} --openssldir=${OPEN_SRC_INSTALL_PREFIX} --libdir=lib -Wno-nullability-completeness -Wno-expansion-to-defined)
   endif()
 
 endif()
@@ -52,6 +47,9 @@ ExternalProject_Add(project_libopenssl
     GIT_TAG           ${OPENSSL_GIT_TAG}
     GIT_PROGRESS      TRUE
     GIT_SHALLOW       TRUE
+    # A tracked non-submodule path skips optional test/provider submodules even
+    # on CMake < 3.16, where an empty GIT_SUBMODULES still initializes them all.
+    GIT_SUBMODULES    "README.md"
     PREFIX            ${CMAKE_CURRENT_BINARY_DIR}/build
     CONFIGURE_COMMAND ${CONFIGURE_COMMAND}
     BUILD_COMMAND     ${MAKE_EXE}

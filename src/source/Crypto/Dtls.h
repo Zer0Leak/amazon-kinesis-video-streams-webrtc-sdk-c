@@ -83,6 +83,7 @@ typedef enum {
 typedef struct {
     DTLS_SESSION_VALIDATION_MODE validationMode;
     PCHAR pExpectedServerHostname;
+    PRtcDtlsConfiguration pDtlsConfiguration;
 } DtlsSessionOptions, *PDtlsSessionOptions;
 
 // DtlsKeyingMaterial is information extracted via https://tools.ietf.org/html/rfc5705
@@ -197,6 +198,10 @@ STATUS freeDtlsSession(PDtlsSession*);
  */
 STATUS dtlsSessionStart(PDtlsSession, BOOL);
 STATUS dtlsSessionProcessPacket(PDtlsSession, PBYTE, PINT32);
+#ifdef KVS_USE_OPENSSL
+// pDataLen is the independent output capacity/result length; NULL input with zero length drains pending records.
+STATUS dtlsSessionProcessPacketWithBuffer(PDtlsSession, PBYTE, INT32, PBYTE, PINT32);
+#endif
 STATUS dtlsSessionIsInitFinished(PDtlsSession, PBOOL);
 STATUS dtlsSessionPopulateKeyingMaterial(PDtlsSession, PDtlsKeyingMaterial);
 STATUS dtlsSessionGetLocalCertificateFingerprint(PDtlsSession, PCHAR, UINT32);

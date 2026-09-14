@@ -43,9 +43,22 @@ function(build_dependency lib_name)
   find_library(
     library_found
     NAMES ${lib_file_name}
-    PATHS ${OPEN_SRC_INSTALL_PREFIX}/lib
+    PATHS ${OPEN_SRC_INSTALL_PREFIX}/lib ${OPEN_SRC_INSTALL_PREFIX}/lib64
     NO_DEFAULT_PATH)
   if(library_found)
+    if(lib_name STREQUAL "openssl")
+      set(expected_openssl_version "4.1.0-alpha1")
+      # Reusing an older SSL installation would silently bypass the upgrade and
+      # can mix dependencies linked against different libcrypto SONAMEs.
+      file(STRINGS "${OPEN_SRC_INSTALL_PREFIX}/include/openssl/opensslv.h"
+           installed_openssl_version REGEX "define OPENSSL_FULL_VERSION_STR ")
+      if(NOT installed_openssl_version MATCHES "\"${expected_openssl_version}\"")
+        message(FATAL_ERROR
+          "${OPEN_SRC_INSTALL_PREFIX} contains a different OpenSSL build. "
+          "Use a fresh build directory and OPEN_SRC_INSTALL_PREFIX for OpenSSL ${expected_openssl_version} "
+          "so all dependencies are rebuilt against the same crypto library.")
+      endif()
+    endif()
     message(STATUS "${lib_name} already built")
     return()
   endif()

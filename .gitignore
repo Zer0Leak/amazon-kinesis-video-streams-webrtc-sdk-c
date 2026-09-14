@@ -3,6 +3,8 @@
 .github/github_deploy_key.enc
 .idea
 build
+build-openssl41/
+open-source-openssl41/
 cmake-build-debug/
 cmake-build-release/
 doc/

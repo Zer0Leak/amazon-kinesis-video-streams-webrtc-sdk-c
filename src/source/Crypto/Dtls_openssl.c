@@ -156,6 +156,10 @@ STATUS dtlsTransmissionTimerCallback(UINT32 timerID, UINT64 currentTime, UINT64 
     MUTEX_LOCK(pDtlsSession->sslLock);
     locked = TRUE;
 
+    CHK(!ATOMIC_LOAD_BOOL(&pDtlsSession->isCleanUp) && !ATOMIC_LOAD_BOOL(&pDtlsSession->isShutdown) &&
+            pDtlsSession->state != RTC_DTLS_TRANSPORT_STATE_FAILED,
+        STATUS_TIMER_QUEUE_STOP_SCHEDULING);
+
     if (ATOMIC_LOAD_BOOL(&pDtlsSession->remoteCertVerificationFailed)) {
         DLOGW("DTLS strict server certificate verification failed for %s during timer-driven handshake processing",
               pDtlsSession->pExpectedServerHostname != NULL ? pDtlsSession->pExpectedServerHostname : "(null)");
@@ -167,7 +171,13 @@ STATUS dtlsTransmissionTimerCallback(UINT32 timerID, UINT64 currentTime, UINT64 
         CHK_STATUS(dtlsSessionCheckRemoteCertificateVerification(pDtlsSession));
         CHK_STATUS(dtlsSessionChangeState(pDtlsSession, RTC_DTLS_TRANSPORT_STATE_CONNECTED));
         ATOMIC_STORE_BOOL(&pDtlsSession->sslInitFinished, TRUE);
-        CHK(FALSE, STATUS_TIMER_QUEUE_STOP_SCHEDULING);
+#if defined(DTLS1_3_VERSION) && !defined(OPENSSL_NO_DTLS1_3)
+        // DTLS 1.3 ACKs and retransmissions continue after the local handshake completes.
+        if (SSL_version(pDtlsSession->pSsl) != DTLS1_3_VERSION)
+#endif
+        {
+            CHK(FALSE, STATUS_TIMER_QUEUE_STOP_SCHEDULING);
+        }
     }
 
     /* In case we need to initiate the handshake */
@@ -188,7 +198,10 @@ STATUS dtlsTransmissionTimerCallback(UINT32 timerID, UINT64 currentTime, UINT64 
     if (timeoutValDefaultTimeUnit == 0) {
         DLOGD("DTLS handshake timeout event, retransmit");
         /* Retransmit the packet */
-        DTLSv1_handle_timeout(pDtlsSession->pSsl);
+        if (DTLSv1_handle_timeout(pDtlsSession->pSsl) < 0) {
+            CHK_STATUS(dtlsSessionChangeState(pDtlsSession, RTC_DTLS_TRANSPORT_STATE_FAILED));
+            CHK(FALSE, STATUS_TIMER_QUEUE_STOP_SCHEDULING);
+        }
         CHK_STATUS(dtlsCheckOutgoingDataBuffer(pDtlsSession));
     }
 
@@ -260,14 +273,16 @@ STATUS createCertificateAndKey(INT32 certificateBits, BOOL generateRSACertificat
     X509_gmtime_adj(X509_get_notAfter(*ppCert), GENERATED_CERTIFICATE_DAYS * SECONDS_IN_A_DAY);
     CHK(X509_set_pubkey(*ppCert, *ppPkey) != 0, STATUS_CERTIFICATE_GENERATION_FAILED);
 
-    CHK((pX509Name = X509_get_subject_name(*ppCert)) != NULL, STATUS_CERTIFICATE_GENERATION_FAILED);
+    CHK((pX509Name = X509_NAME_new()) != NULL, STATUS_CERTIFICATE_GENERATION_FAILED);
     X509_NAME_add_entry_by_txt(pX509Name, "O", MBSTRING_ASC, (PUINT8) GENERATED_CERTIFICATE_NAME, -1, -1, 0);
     X509_NAME_add_entry_by_txt(pX509Name, "CN", MBSTRING_ASC, (PUINT8) GENERATED_CERTIFICATE_NAME, -1, -1, 0);
 
+    CHK(X509_set_subject_name(*ppCert, pX509Name) != 0, STATUS_CERTIFICATE_GENERATION_FAILED);
     CHK(X509_set_issuer_name(*ppCert, pX509Name) != 0, STATUS_CERTIFICATE_GENERATION_FAILED);
-    CHK(X509_sign(*ppCert, *ppPkey, EVP_sha1()) != 0, STATUS_CERTIFICATE_GENERATION_FAILED);
+    CHK(X509_sign(*ppCert, *ppPkey, EVP_sha256()) != 0, STATUS_CERTIFICATE_GENERATION_FAILED);
 
 CleanUp:
+    X509_NAME_free(pX509Name);
     if (STATUS_FAILED(retStatus)) {
         freeCertificateAndKey(ppCert, ppPkey);
     }
@@ -281,7 +296,6 @@ STATUS createSslCtx(PDtlsSessionCertificateInfo pCertificates, UINT32 certCount,
     ENTERS();
     STATUS retStatus = STATUS_SUCCESS;
     SSL_CTX* pSslCtx = NULL;
-    EC_KEY* pEcKey = NULL;
     UINT32 i;
 
     CHK(pCertificates != NULL && ppSslCtx != NULL, STATUS_NULL_ARG);
@@ -305,6 +319,11 @@ STATUS createSslCtx(PDtlsSessionCertificateInfo pCertificates, UINT32 certCount,
 
     CHK(pSslCtx != NULL, STATUS_SSL_CTX_CREATION_FAILED);
 
+    // Keep existing peers on DTLS 1.2; explicit configuration opts in to DTLS 1.3.
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+    CHK(SSL_CTX_set_max_proto_version(pSslCtx, DTLS1_2_VERSION) == 1, STATUS_SSL_CTX_CREATION_FAILED);
+#endif
+
     // Version greater than or equal to 1.0.2
 #if (OPENSSL_VERSION_NUMBER >= 0x10002000L) && (OPENSSL_VERSION_NUMBER < 0x30000000L)
     SSL_CTX_set_ecdh_auto(pSslCtx, TRUE);
@@ -319,7 +338,7 @@ STATUS createSslCtx(PDtlsSessionCertificateInfo pCertificates, UINT32 certCount,
 
     for (i = 0; i < certCount; i++) {
         CHK(SSL_CTX_use_certificate(pSslCtx, pCertificates[i].pCert) == 1, STATUS_SSL_CTX_CREATION_FAILED);
-        CHK(SSL_CTX_use_PrivateKey(pSslCtx, pCertificates[i].pKey) == 1 || SSL_CTX_check_private_key(pSslCtx) == 1, STATUS_SSL_CTX_CREATION_FAILED);
+        CHK(SSL_CTX_use_PrivateKey(pSslCtx, pCertificates[i].pKey) == 1 && SSL_CTX_check_private_key(pSslCtx) == 1, STATUS_SSL_CTX_CREATION_FAILED);
     }
 
     CHK(SSL_CTX_set_cipher_list(pSslCtx, "HIGH:!aNULL:!MD5:!RC4") == 1, STATUS_SSL_CTX_CREATION_FAILED);
@@ -328,10 +347,6 @@ STATUS createSslCtx(PDtlsSessionCertificateInfo pCertificates, UINT32 certCount,
 CleanUp:
     if (STATUS_FAILED(retStatus) && pSslCtx != NULL) {
         SSL_CTX_free(pSslCtx);
-    }
-
-    if (pEcKey != NULL) {
-        EC_KEY_free(pEcKey);
     }
 
     LEAVES();
@@ -349,11 +364,22 @@ STATUS createSsl(SSL_CTX* pSslCtx, SSL** ppSsl)
     CHK(pSslCtx != NULL && ppSsl != NULL, STATUS_NULL_ARG);
 
     CHK((pSsl = SSL_new(pSslCtx)) != NULL, STATUS_SSL_CTX_CREATION_FAILED);
-    CHK((pReadBIO = BIO_new(BIO_s_mem())) != NULL, STATUS_SSL_CTX_CREATION_FAILED);
-    CHK((pWriteBIO = BIO_new(BIO_s_mem())) != NULL, STATUS_SSL_CTX_CREATION_FAILED);
+#if defined(DTLS1_3_VERSION) && !defined(OPENSSL_NO_DTLS1_3)
+    if (SSL_CTX_get_min_proto_version(pSslCtx) == DTLS1_3_VERSION) {
+        // PQC flights span multiple UDP packets. Preserve OpenSSL's datagram boundaries.
+        CHK((pReadBIO = BIO_new(BIO_s_dgram_mem())) != NULL, STATUS_SSL_CTX_CREATION_FAILED);
+        CHK((pWriteBIO = BIO_new(BIO_s_dgram_mem())) != NULL, STATUS_SSL_CTX_CREATION_FAILED);
+        SSL_set_options(pSsl, SSL_OP_NO_QUERY_MTU);
+        CHK(DTLS_set_link_mtu(pSsl, DEFAULT_MTU_SIZE_BYTES) > 0, STATUS_SSL_CTX_CREATION_FAILED);
+    } else
+#endif
+    {
+        CHK((pReadBIO = BIO_new(BIO_s_mem())) != NULL, STATUS_SSL_CTX_CREATION_FAILED);
+        CHK((pWriteBIO = BIO_new(BIO_s_mem())) != NULL, STATUS_SSL_CTX_CREATION_FAILED);
 
-    BIO_set_mem_eof_return(pReadBIO, -1);
-    BIO_set_mem_eof_return(pWriteBIO, -1);
+        BIO_set_mem_eof_return(pReadBIO, -1);
+        BIO_set_mem_eof_return(pWriteBIO, -1);
+    }
     SSL_set_bio(pSsl, pReadBIO, pWriteBIO);
     freeBios = FALSE;
 
@@ -372,7 +398,7 @@ CleanUp:
         }
     }
 
-    return STATUS_SUCCESS;
+    return retStatus;
 }
 
 STATUS freeCertificateAndKey(X509** ppCert, EVP_PKEY** ppPkey)
@@ -417,7 +443,8 @@ STATUS createDtlsSessionWithOptions(PDtlsSessionCallbacks pDtlsSessionCallbacks,
     DtlsSessionCertificateInfo certInfos[MAX_RTCCONFIGURATION_CERTIFICATES];
     MEMSET(certInfos, 0x00, SIZEOF(certInfos));
 
-    CHK(ppDtlsSession != NULL, STATUS_NULL_ARG);
+    CHK(ppDtlsSession != NULL && pDtlsSessionCallbacks != NULL, STATUS_NULL_ARG);
+    *ppDtlsSession = NULL;
     CHK_STATUS(dtlsValidateRtcCertificates(pRtcCertificates, &certCount));
 
     pDtlsSession = MEMCALLOC(SIZEOF(DtlsSession), 1);
@@ -457,6 +484,18 @@ STATUS createDtlsSessionWithOptions(PDtlsSessionCallbacks pDtlsSessionCallbacks,
     }
 
     PROFILE_CALL(CHK_STATUS(createSslCtx(certInfos, pDtlsSession->certificateCount, &pDtlsSession->pSslCtx)), "Create SSL Context");
+#if defined(DTLS1_3_VERSION) && !defined(OPENSSL_NO_DTLS1_3)
+    if (pDtlsSessionOptions != NULL && pDtlsSessionOptions->pDtlsConfiguration != NULL) {
+        PRtcDtlsConfiguration pConfig = pDtlsSessionOptions->pDtlsConfiguration;
+        // SDP currently advertises a single local fingerprint. Avoid ambiguous certificate selection.
+        CHK(pDtlsSession->certificateCount == 1, STATUS_INVALID_ARG);
+        CHK(SSL_CTX_set_max_proto_version(pDtlsSession->pSslCtx, DTLS1_3_VERSION) == 1 &&
+                SSL_CTX_set_min_proto_version(pDtlsSession->pSslCtx, DTLS1_3_VERSION) == 1 &&
+                SSL_CTX_set1_groups_list(pDtlsSession->pSslCtx, pConfig->pGroups) == 1 &&
+                SSL_CTX_set1_sigalgs_list(pDtlsSession->pSslCtx, pConfig->pSignatureAlgorithms) == 1,
+            STATUS_INVALID_ARG);
+    }
+#endif
     PROFILE_CALL(CHK_STATUS(createSsl(pDtlsSession->pSslCtx, &pDtlsSession->pSsl)), "Create SSL session");
     SSL_set_app_data(pDtlsSession->pSsl, pDtlsSession);
     CHK_STATUS(dtlsSessionConfigureRemoteCertificateValidation(pDtlsSession));
@@ -477,12 +516,11 @@ CleanUp:
         }
     }
 
-    if (STATUS_FAILED(retStatus)) {
-        freeDtlsSession(&pDtlsSession);
-    }
-
     if (acquired) {
         releaseDtlsSession(pDtlsSession);
+    }
+    if (STATUS_FAILED(retStatus)) {
+        freeDtlsSession(&pDtlsSession);
     }
     LEAVES();
     return retStatus;
@@ -588,7 +626,8 @@ STATUS dtlsSessionHandshakeInThread(PDtlsSession pDtlsSession, BOOL isServer)
 
     CHK(!ATOMIC_LOAD_BOOL(&pDtlsSession->isCleanUp), STATUS_DTLS_SESSION_ALREADY_FREED);
     CHK_STATUS(beginHandshakeProcess(pDtlsSession, isServer, &sslRet));
-    while (!(ATOMIC_LOAD_BOOL(&pDtlsSession->sslInitFinished)) && !dtlsHandshakeErrored && !(ATOMIC_LOAD_BOOL(&pDtlsSession->isCleanUp))) {
+    while (!(ATOMIC_LOAD_BOOL(&pDtlsSession->sslInitFinished)) && !dtlsHandshakeErrored && !(ATOMIC_LOAD_BOOL(&pDtlsSession->isCleanUp)) &&
+           !ATOMIC_LOAD_BOOL(&pDtlsSession->isShutdown) && pDtlsSession->state != RTC_DTLS_TRANSPORT_STATE_FAILED) {
         switch (pDtlsSession->handshakeState) {
             case DTLS_STATE_HANDSHAKE_NEW:
                 if (sslRet <= 0) {
@@ -693,6 +732,13 @@ STATUS dtlsSessionHandshakeInThread(PDtlsSession pDtlsSession, BOOL isServer)
         }
     }
     DLOGI("Done with handshake, exiting from this thread");
+#if defined(DTLS1_3_VERSION) && !defined(OPENSSL_NO_DTLS1_3)
+    if (!dtlsHandshakeErrored && !ATOMIC_LOAD_BOOL(&pDtlsSession->isCleanUp) && pDtlsSession->state != RTC_DTLS_TRANSPORT_STATE_FAILED &&
+        SSL_version(pDtlsSession->pSsl) == DTLS1_3_VERSION && pDtlsSession->timerId == MAX_UINT32) {
+        CHK_STATUS(timerQueueAddTimer(pDtlsSession->timerQueueHandle, DTLS_SESSION_TIMER_START_DELAY, DTLS_TRANSMISSION_INTERVAL,
+                                      dtlsTransmissionTimerCallback, (UINT64) pDtlsSession, &pDtlsSession->timerId));
+    }
+#endif
 CleanUp:
     CHK_LOG_ERR(retStatus);
     if (locked) {
@@ -717,6 +763,11 @@ STATUS freeDtlsSession(PDtlsSession* ppDtlsSession)
 
     DLOGI("Freeing the DTLS session");
     ATOMIC_STORE_BOOL(&pDtlsSession->isCleanUp, TRUE);
+    if (IS_VALID_CVAR_VALUE(pDtlsSession->receivePacketCvar) && IS_VALID_MUTEX_VALUE(pDtlsSession->sslLock)) {
+        MUTEX_LOCK(pDtlsSession->sslLock);
+        CVAR_BROADCAST(pDtlsSession->receivePacketCvar);
+        MUTEX_UNLOCK(pDtlsSession->sslLock);
+    }
 
     // Wait until refCount drops to 0 or add a timeout mechanism to avoid indefinite waits
     while (ATOMIC_LOAD(&pDtlsSession->objRefCount) > 0) {
@@ -757,10 +808,15 @@ CleanUp:
 
 STATUS dtlsSessionProcessPacket(PDtlsSession pDtlsSession, PBYTE pData, PINT32 pDataLen)
 {
+    return dtlsSessionProcessPacketWithBuffer(pDtlsSession, pData, pDataLen != NULL ? *pDataLen : 0, pData, pDataLen);
+}
+
+STATUS dtlsSessionProcessPacketWithBuffer(PDtlsSession pDtlsSession, PBYTE pInput, INT32 inputLen, PBYTE pData, PINT32 pDataLen)
+{
     ENTERS();
     STATUS retStatus = STATUS_SUCCESS;
     BOOL locked = FALSE, isClosed = FALSE;
-    INT32 sslRet = 0, sslErr;
+    INT32 sslRet = 0, sslErr, readError;
     INT32 dataLen = 0;
 
     acquireDtlsSession(pDtlsSession);
@@ -773,9 +829,9 @@ STATUS dtlsSessionProcessPacket(PDtlsSession pDtlsSession, PBYTE pData, PINT32 p
     CVAR_BROADCAST(pDtlsSession->receivePacketCvar);
 
     if (!ATOMIC_LOAD_BOOL(&pDtlsSession->isCleanUp)) {
-        sslRet = BIO_write(SSL_get_rbio(pDtlsSession->pSsl), pData, *pDataLen);
-        if (sslRet <= 0) {
-            LOG_OPENSSL_ERROR("BIO_write");
+        if (pInput != NULL && inputLen > 0) {
+            sslRet = BIO_write(SSL_get_rbio(pDtlsSession->pSsl), pInput, inputLen);
+            CHK(sslRet == inputLen, STATUS_INTERNAL_ERROR);
         }
 
         // should clear error before SSL_read: https://stackoverflow.com/a/47218133
@@ -793,12 +849,19 @@ STATUS dtlsSessionProcessPacket(PDtlsSession pDtlsSession, PBYTE pData, PINT32 p
             DLOGI("Detected DTLS close_notify alert");
             isClosed = TRUE;
         } else if (sslRet <= 0) {
+            readError = SSL_get_error(pDtlsSession->pSsl, sslRet);
             LOG_OPENSSL_ERROR("SSL_read");
+#if defined(DTLS1_3_VERSION) && !defined(OPENSSL_NO_DTLS1_3)
+            if (SSL_get_min_proto_version(pDtlsSession->pSsl) == DTLS1_3_VERSION && (readError == SSL_ERROR_SSL || readError == SSL_ERROR_SYSCALL)) {
+                CHK_STATUS(dtlsCheckOutgoingDataBuffer(pDtlsSession));
+                CHK_STATUS(dtlsSessionChangeState(pDtlsSession, RTC_DTLS_TRANSPORT_STATE_FAILED));
+                CHK(FALSE, STATUS_SSL_CONNECTION_FAILED);
+            }
+#endif
         }
 
-        if (!ATOMIC_LOAD_BOOL(&pDtlsSession->sslInitFinished)) {
-            CHK_STATUS(dtlsCheckOutgoingDataBuffer(pDtlsSession));
-        }
+        // Also flush post-handshake ACKs and alerts.
+        CHK_STATUS(dtlsCheckOutgoingDataBuffer(pDtlsSession));
 
         /* if SSL_read failed then set to 0 */
         dataLen = sslRet < 0 ? 0 : sslRet;
@@ -833,9 +896,6 @@ STATUS dtlsSessionPutApplicationData(PDtlsSession pDtlsSession, PBYTE pData, INT
     ENTERS();
     STATUS retStatus = STATUS_SUCCESS;
     INT32 amountWritten;
-    BYTE buf[MAX_UDP_PACKET_SIZE];
-    BIO* wbio;
-    SIZE_T pending;
     BOOL locked = FALSE;
 
     acquireDtlsSession(pDtlsSession);
@@ -853,11 +913,7 @@ STATUS dtlsSessionPutApplicationData(PDtlsSession pDtlsSession, PBYTE pData, INT
         CHK(FALSE, STATUS_INTERNAL_ERROR);
     }
 
-    wbio = SSL_get_wbio(pDtlsSession->pSsl);
-    if ((pending = BIO_ctrl_pending(wbio)) > 0) {
-        pending = BIO_read(wbio, buf, pending);
-        pDtlsSession->dtlsSessionCallbacks.outboundPacketFn(pDtlsSession->dtlsSessionCallbacks.outBoundPacketFnCustomData, buf, (UINT32) pending);
-    }
+    CHK_STATUS(dtlsCheckOutgoingDataBuffer(pDtlsSession));
 
 CleanUp:
     if (locked) {
@@ -901,22 +957,18 @@ STATUS dtlsCheckOutgoingDataBuffer(PDtlsSession pDtlsSession)
     ENTERS();
     STATUS retStatus = STATUS_SUCCESS;
     BIO* pWriteBIO = NULL;
-    INT32 dataLenWritten = 0, sslErr = 0;
+    INT32 dataLenWritten = 0;
 
     CHK(!(ATOMIC_LOAD_BOOL(&pDtlsSession->isCleanUp)), STATUS_DTLS_SESSION_ALREADY_FREED);
 
     pWriteBIO = SSL_get_wbio(pDtlsSession->pSsl);
-    // proceed if write BIO is not empty
-    CHK(BIO_ctrl_pending(pWriteBIO) > 0, retStatus);
-
-    // BIO_read removes read data from the write BIO
-    dataLenWritten = BIO_read(pWriteBIO, pDtlsSession->outgoingDataBuffer, ARRAY_SIZE(pDtlsSession->outgoingDataBuffer));
-    if (dataLenWritten > 0) {
+    while (BIO_ctrl_pending(pWriteBIO) > 0) {
+        // A datagram BIO returns one complete UDP packet per read.
+        dataLenWritten = BIO_read(pWriteBIO, pDtlsSession->outgoingDataBuffer, ARRAY_SIZE(pDtlsSession->outgoingDataBuffer));
+        CHK(dataLenWritten > 0, STATUS_INTERNAL_ERROR);
         pDtlsSession->outgoingDataLen = (UINT32) dataLenWritten;
         pDtlsSession->dtlsSessionCallbacks.outboundPacketFn(pDtlsSession->dtlsSessionCallbacks.outBoundPacketFnCustomData,
                                                             pDtlsSession->outgoingDataBuffer, pDtlsSession->outgoingDataLen);
-    } else {
-        LOG_OPENSSL_ERROR("BIO_read");
     }
 
 CleanUp:
@@ -935,7 +987,7 @@ STATUS dtlsSessionIsInitFinished(PDtlsSession pDtlsSession, PBOOL pIsConnected)
 
     MUTEX_LOCK(pDtlsSession->sslLock);
     locked = TRUE;
-    *pIsConnected = SSL_is_init_finished(pDtlsSession->pSsl);
+    *pIsConnected = pDtlsSession->state != RTC_DTLS_TRANSPORT_STATE_FAILED && SSL_is_init_finished(pDtlsSession->pSsl);
 
     // The state change happens in the timer callback anyways. But the callback is invoked every
     // 200 ms, hence by the time the state change occurs, it could be 200ms later worst case.

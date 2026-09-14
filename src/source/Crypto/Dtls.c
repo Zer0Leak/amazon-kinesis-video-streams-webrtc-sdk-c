@@ -44,7 +44,7 @@ STATUS dtlsValidateRtcCertificates(PRtcCertificate pRtcCertificates, PUINT32 pCo
     // No certs have been specified
     CHK(pRtcCertificates != NULL, retStatus);
 
-    for (i = 0, *pCount = 0; pRtcCertificates[i].pCertificate != NULL && i < MAX_RTCCONFIGURATION_CERTIFICATES; i++) {
+    for (i = 0, *pCount = 0; i < MAX_RTCCONFIGURATION_CERTIFICATES && pRtcCertificates[i].pCertificate != NULL; i++) {
         CHK(pRtcCertificates[i].privateKeySize == 0 || pRtcCertificates[i].pPrivateKey != NULL, STATUS_SSL_INVALID_CERTIFICATE_BITS);
     }
 
@@ -97,6 +97,17 @@ STATUS dtlsSessionCopyOptions(PDtlsSession pDtlsSession, PDtlsSessionOptions pDt
     pDtlsSession->pExpectedServerHostname = NULL;
 
     CHK(pDtlsSessionOptions != NULL, retStatus);
+
+    if (pDtlsSessionOptions->pDtlsConfiguration != NULL) {
+#if !defined(KVS_USE_OPENSSL) || !defined(DTLS1_3_VERSION) || defined(OPENSSL_NO_DTLS1_3)
+        CHK(FALSE, STATUS_NOT_IMPLEMENTED);
+#else
+        CHK(pDtlsSessionOptions->pDtlsConfiguration->pGroups != NULL && pDtlsSessionOptions->pDtlsConfiguration->pGroups[0] != '\0' &&
+                pDtlsSessionOptions->pDtlsConfiguration->pSignatureAlgorithms != NULL &&
+                pDtlsSessionOptions->pDtlsConfiguration->pSignatureAlgorithms[0] != '\0',
+            STATUS_INVALID_ARG);
+#endif
+    }
 
     pDtlsSession->validationMode = pDtlsSessionOptions->validationMode;
     if (pDtlsSession->validationMode == DTLS_SESSION_VALIDATION_MODE_STRICT_SERVER) {

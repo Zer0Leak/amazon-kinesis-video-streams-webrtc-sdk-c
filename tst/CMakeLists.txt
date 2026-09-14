@@ -44,8 +44,8 @@ target_link_libraries(webrtc_client_test
     kvsWebrtcSignalingClient
     ${EXTRA_DEPS}
     kvsCommonLws
+    ${OPENSSL_SSL_LIBRARY}
     ${OPENSSL_CRYPTO_LIBRARY}
     kvspicUtils
     ${GTEST_LIBNAME}
     ${AWS_SDK_TEST_LIBS})
-

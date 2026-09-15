@@ -75,6 +75,11 @@ STATUS createSignalingSync(PSignalingClientInfoInternal pClientInfo, PChannelInf
     // Allocate enough storage
     CHK(NULL != (pSignalingClient = (PSignalingClient) MEMCALLOC(1, SIZEOF(SignalingClient))), STATUS_NOT_ENOUGH_MEMORY);
 
+    pSignalingClient->receiveWorkLock = MUTEX_CREATE(FALSE);
+    CHK(IS_VALID_MUTEX_VALUE(pSignalingClient->receiveWorkLock), STATUS_INVALID_OPERATION);
+    pSignalingClient->receiveWorkCvar = CVAR_CREATE();
+    CHK(IS_VALID_CVAR_VALUE(pSignalingClient->receiveWorkCvar), STATUS_INVALID_OPERATION);
+
     // Initialize the listener and restart thread trackers
     CHK_STATUS(initializeThreadTracker(&pSignalingClient->listenerTracker));
     CHK_STATUS(initializeThreadTracker(&pSignalingClient->reconnecterTracker));
@@ -208,6 +213,8 @@ STATUS createSignalingSync(PSignalingClientInfoInternal pClientInfo, PChannelInf
     CHK(IS_VALID_CVAR_VALUE(pSignalingClient->sendCvar), STATUS_INVALID_OPERATION);
     pSignalingClient->sendLock = MUTEX_CREATE(FALSE);
     CHK(IS_VALID_MUTEX_VALUE(pSignalingClient->sendLock), STATUS_INVALID_OPERATION);
+    pSignalingClient->outboundMessageLock = MUTEX_CREATE(FALSE);
+    CHK(IS_VALID_MUTEX_VALUE(pSignalingClient->outboundMessageLock), STATUS_INVALID_OPERATION);
     pSignalingClient->receiveCvar = CVAR_CREATE();
     CHK(IS_VALID_CVAR_VALUE(pSignalingClient->receiveCvar), STATUS_INVALID_OPERATION);
     pSignalingClient->receiveLock = MUTEX_CREATE(FALSE);
@@ -294,9 +301,27 @@ STATUS freeSignaling(PSignalingClient* ppSignalingClient)
     pSignalingClient = *ppSignalingClient;
     CHK(pSignalingClient != NULL, retStatus);
 
-    ATOMIC_STORE_BOOL(&pSignalingClient->shutdown, TRUE);
+    // Stop receive admission before terminating its producers. A successful
+    // free does not return until every admitted wrapper and callback is done.
+    if (IS_VALID_MUTEX_VALUE(pSignalingClient->receiveWorkLock)) {
+        MUTEX_LOCK(pSignalingClient->receiveWorkLock);
+        ATOMIC_STORE_BOOL(&pSignalingClient->shutdown, TRUE);
+        MUTEX_UNLOCK(pSignalingClient->receiveWorkLock);
+    } else {
+        ATOMIC_STORE_BOOL(&pSignalingClient->shutdown, TRUE);
+    }
 
-    terminateOngoingOperations(pSignalingClient);
+    // Retain the handle and all client-owned storage if shutdown cannot drain.
+    CHK_STATUS(terminateOngoingOperations(pSignalingClient));
+
+    if (IS_VALID_MUTEX_VALUE(pSignalingClient->receiveWorkLock)) {
+        MUTEX_LOCK(pSignalingClient->receiveWorkLock);
+        while (pSignalingClient->receiveWorkCount != 0 && STATUS_SUCCEEDED(retStatus)) {
+            retStatus = CVAR_WAIT(pSignalingClient->receiveWorkCvar, pSignalingClient->receiveWorkLock, SIGNALING_CLIENT_SHUTDOWN_TIMEOUT);
+        }
+        MUTEX_UNLOCK(pSignalingClient->receiveWorkLock);
+        CHK_STATUS(retStatus);
+    }
 
     if (pSignalingClient->pWebsocketContext != NULL) {
         MUTEX_LOCK(pSignalingClient->lwsServiceLock);
@@ -332,6 +357,10 @@ STATUS freeSignaling(PSignalingClient* ppSignalingClient)
 
     if (IS_VALID_CVAR_VALUE(pSignalingClient->sendCvar)) {
         CVAR_FREE(pSignalingClient->sendCvar);
+    }
+
+    if (IS_VALID_MUTEX_VALUE(pSignalingClient->outboundMessageLock)) {
+        MUTEX_FREE(pSignalingClient->outboundMessageLock);
     }
 
     if (IS_VALID_MUTEX_VALUE(pSignalingClient->receiveLock)) {
@@ -376,6 +405,14 @@ STATUS freeSignaling(PSignalingClient* ppSignalingClient)
 
     uninitializeThreadTracker(&pSignalingClient->reconnecterTracker);
     uninitializeThreadTracker(&pSignalingClient->listenerTracker);
+
+    if (IS_VALID_CVAR_VALUE(pSignalingClient->receiveWorkCvar)) {
+        CVAR_FREE(pSignalingClient->receiveWorkCvar);
+    }
+
+    if (IS_VALID_MUTEX_VALUE(pSignalingClient->receiveWorkLock)) {
+        MUTEX_FREE(pSignalingClient->receiveWorkLock);
+    }
 
     MEMFREE(pSignalingClient);
 
@@ -457,11 +494,20 @@ STATUS terminateOngoingOperations(PSignalingClient pSignalingClient)
 
     CHK(pSignalingClient != NULL, STATUS_NULL_ARG);
 
-    // Terminate the listener thread if alive
-    terminateLwsListenerLoop(pSignalingClient);
+    // Do not destroy client state after an incomplete thread shutdown. Invalid
+    // trackers are possible while cleaning up a partially-created client.
+    CHK_STATUS(terminateLwsListenerLoop(pSignalingClient));
+    if (IS_VALID_MUTEX_VALUE(pSignalingClient->reconnecterTracker.lock)) {
+        CHK_STATUS(awaitForThreadTermination(&pSignalingClient->reconnecterTracker, SIGNALING_CLIENT_SHUTDOWN_TIMEOUT));
+    }
 
-    // Await for the reconnect thread to exit
-    awaitForThreadTermination(&pSignalingClient->reconnecterTracker, SIGNALING_CLIENT_SHUTDOWN_TIMEOUT);
+    // A reconnect worker can pass its shutdown check immediately before free
+    // publishes shutdown, then create a replacement listener. Drain reconnect
+    // first and terminate that final listener before client storage is freed.
+    CHK_STATUS(terminateLwsListenerLoop(pSignalingClient));
+    if (IS_VALID_MUTEX_VALUE(pSignalingClient->listenerTracker.lock)) {
+        CHK_STATUS(awaitForThreadTermination(&pSignalingClient->listenerTracker, SIGNALING_CLIENT_SHUTDOWN_TIMEOUT));
+    }
 
 CleanUp:
 
@@ -475,11 +521,23 @@ STATUS signalingSendMessageSync(PSignalingClient pSignalingClient, PSignalingMes
 {
     ENTERS();
     STATUS retStatus = STATUS_SUCCESS;
-    BOOL removeFromList = FALSE;
+    BOOL removeFromList = FALSE, outboundLocked = FALSE;
 
     CHK(pSignalingClient != NULL && pSignalingMessage != NULL, STATUS_NULL_ARG);
     CHK(pSignalingMessage->peerClientId != NULL && pSignalingMessage->payload != NULL, STATUS_INVALID_ARG);
     CHK(pSignalingMessage->version <= SIGNALING_MESSAGE_CURRENT_VERSION, STATUS_SIGNALING_INVALID_SIGNALING_MESSAGE_VERSION);
+
+    // State-machine operations can wait for the LWS service lock. Complete
+    // this check before taking the outbound call-info lease so a close callback
+    // can always acquire that lease and wake a blocked sender.
+    CHK_STATUS(acceptSignalingStateMachineState(pSignalingClient, SIGNALING_STATE_CONNECTED | SIGNALING_STATE_JOIN_SESSION_CONNECTED));
+
+    // One call info owns one outbound buffer. This lock also leases that call
+    // info against listener cleanup until the complete synchronous operation,
+    // including message-queue cleanup, has finished.
+    MUTEX_LOCK(pSignalingClient->outboundMessageLock);
+    outboundLocked = TRUE;
+    CHK(ATOMIC_LOAD_BOOL(&pSignalingClient->connected) && pSignalingClient->pOngoingCallInfo != NULL, STATUS_SIGNALING_MESSAGE_DELIVERY_FAILED);
 
     // Store the signaling message
     CHK_STATUS(signalingStoreOngoingMessage(pSignalingClient, pSignalingMessage));
@@ -507,6 +565,10 @@ CleanUp:
     // Remove from the list if previously added
     if (removeFromList) {
         signalingRemoveOngoingMessage(pSignalingClient, pSignalingMessage->correlationId);
+    }
+
+    if (outboundLocked) {
+        MUTEX_UNLOCK(pSignalingClient->outboundMessageLock);
     }
 
     LEAVES();
@@ -979,6 +1041,9 @@ STATUS initializeThreadTracker(PThreadTracker pThreadTracker)
     CHK(pThreadTracker != NULL, STATUS_NULL_ARG);
 
     pThreadTracker->threadId = INVALID_TID_VALUE;
+    pThreadTracker->lock = INVALID_MUTEX_VALUE;
+    pThreadTracker->await = INVALID_CVAR_VALUE;
+    ATOMIC_STORE_BOOL(&pThreadTracker->terminated, TRUE);
 
     pThreadTracker->lock = MUTEX_CREATE(FALSE);
     CHK(IS_VALID_MUTEX_VALUE(pThreadTracker->lock), STATUS_INVALID_OPERATION);
@@ -986,9 +1051,17 @@ STATUS initializeThreadTracker(PThreadTracker pThreadTracker)
     pThreadTracker->await = CVAR_CREATE();
     CHK(IS_VALID_CVAR_VALUE(pThreadTracker->await), STATUS_INVALID_OPERATION);
 
-    ATOMIC_STORE_BOOL(&pThreadTracker->terminated, TRUE);
-
 CleanUp:
+    if (STATUS_FAILED(retStatus) && pThreadTracker != NULL) {
+        if (IS_VALID_CVAR_VALUE(pThreadTracker->await)) {
+            CVAR_FREE(pThreadTracker->await);
+            pThreadTracker->await = INVALID_CVAR_VALUE;
+        }
+        if (IS_VALID_MUTEX_VALUE(pThreadTracker->lock)) {
+            MUTEX_FREE(pThreadTracker->lock);
+            pThreadTracker->lock = INVALID_MUTEX_VALUE;
+        }
+    }
     return retStatus;
 }
 
@@ -999,10 +1072,12 @@ STATUS uninitializeThreadTracker(PThreadTracker pThreadTracker)
 
     if (IS_VALID_MUTEX_VALUE(pThreadTracker->lock)) {
         MUTEX_FREE(pThreadTracker->lock);
+        pThreadTracker->lock = INVALID_MUTEX_VALUE;
     }
 
     if (IS_VALID_CVAR_VALUE(pThreadTracker->await)) {
         CVAR_FREE(pThreadTracker->await);
+        pThreadTracker->await = INVALID_CVAR_VALUE;
     }
 
 CleanUp:

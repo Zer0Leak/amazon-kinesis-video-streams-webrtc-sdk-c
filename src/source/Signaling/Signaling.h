@@ -313,6 +313,10 @@ typedef struct {
     // Sync mutex for sending condition variable
     MUTEX sendLock;
 
+    // Serializes the shared outbound buffer and keeps pOngoingCallInfo alive
+    // for the duration of a synchronous send.
+    MUTEX outboundMessageLock;
+
     // Conditional variable for sending interlock
     CVAR sendCvar;
 
@@ -336,6 +340,12 @@ typedef struct {
 
     // Restarted thread handler
     ThreadTracker reconnecterTracker;
+
+    // Includes queued, not-yet-started receive wrappers and active callbacks.
+    // The shutdown flag and this count are ordered by receiveWorkLock.
+    MUTEX receiveWorkLock;
+    CVAR receiveWorkCvar;
+    UINT32 receiveWorkCount;
 
     // Generic websocket context - can be used by any implementation
     PVOID pWebsocketContext;
